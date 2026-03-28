@@ -1,0 +1,21 @@
+{
+  "sample_id": "b008ae91-32cf-4d7d-84e4-996144e4edb7",
+  "origin": "https://www.slavcorpora.ru",
+  "images": [
+    {
+      "index": 1,
+      "filename": "slav_01.png",
+      "url": "https://www.slavcorpora.ru/images/122ebb37-36b4-42fb-b776-cae0b0800a43/image-0.jpeg"
+    },
+    {
+      "index": 2,
+      "filename": "slav_02.png",
+      "url": "https://www.slavcorpora.ru/images/189b4b07-9b5e-4815-aff6-b1193a32bc62/image-0.7.jpeg"
+    },
+    {
+      "index": 3,
+      "filename": "slav_03.png",
+      "url": "https://www.slavcorpora.ru/images/1e97e643-f2ea-4a26-94f1-aa4df8cdc173/image-1-2.jpeg"
+    }
+  ]
+}
