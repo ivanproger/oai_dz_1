@@ -171,11 +171,16 @@ def process_image(path: Path, out_dir: Path, m: int, n: int, k: float):
 
     save_rgb(img, out_dir / f"{base}_original.png")
 
-
     r, g, b = rgb_split(img)
-    save_gray(r, out_dir / f"{base}_R.png")
-    save_gray(g, out_dir / f"{base}_G.png")
-    save_gray(b, out_dir / f"{base}_B.png")
+    r_img = np.zeros_like(img)
+    g_img = np.zeros_like(img)
+    b_img = np.zeros_like(img)
+    r_img[..., 0] = r
+    g_img[..., 1] = g
+    b_img[..., 2] = b
+    save_rgb(r_img, out_dir / f"{base}_R.png")
+    save_rgb(g_img, out_dir / f"{base}_G.png")
+    save_rgb(b_img, out_dir / f"{base}_B.png")
 
 
     h, s, i = rgb_to_hsi(img)
