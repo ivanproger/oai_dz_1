@@ -1,0 +1,4 @@
+ground_truth=אני אוהב אותך
+predicted=אני אוהב אותך
+errors=0
+accuracy=100.00
