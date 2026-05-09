@@ -1,0 +1,3 @@
+Phrase (logical): אני אוהב אותך
+Reading order: right-to-left
+Segments found: 11
