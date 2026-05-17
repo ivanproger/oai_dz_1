@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+TOKEN_GUITAR = "\u0433\u0438\u0442\u0430\u0440"
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,20 +41,20 @@ def ensure_dirs(paths: list[Path]) -> None:
 
 
 def find_guitar_source(search_dirs: list[Path]) -> Path:
-    candidates: list[Path] = []
-    token_guitar = "гитар"
+    token_guitar = "\u0433\u0438\u0442\u0430\u0440"
     for directory in search_dirs:
         if not directory.exists():
             continue
+        candidates: list[Path] = []
         for path in directory.iterdir():
             if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
                 name = path.name.casefold()
                 if token_guitar in name or "guitar" in name:
                     candidates.append(path)
-    if not candidates:
-        raise FileNotFoundError("Не найден файл записи гитары.")
-    candidates.sort(key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
-    return candidates[0]
+        if candidates:
+            candidates.sort(key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
+            return candidates[0]
+    raise FileNotFoundError("\u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0444\u0430\u0439\u043b \u0437\u0430\u043f\u0438\u0441\u0438 \u0433\u0438\u0442\u0430\u0440\u044b.")
 def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     process = subprocess.run(
@@ -553,7 +554,6 @@ def build_readme_pdf(
         "Для выполнения задания использована запись звучания гитары, приведённая к монофоническому WAV-формату.",
         "Уровень шумового фона оценён по наименее энергичным окнам и после спектрального вычитания уменьшен.",
         "Глобальный максимум энергии теперь определён однозначно: показаны и численные границы ячейки, и её положение на карте E(t,f).",
-        "Отчёт является самодостаточным: в нём приведены методика, параметры, спектрограммы, карта энергии и итоговые выводы.",
     ]
     for item in conclusions:
         draw3.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
