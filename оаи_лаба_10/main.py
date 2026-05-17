@@ -56,17 +56,23 @@ def audio_files(search_dirs: list[Path]) -> list[Path]:
 def select_source(paths: list[Path], kind: str) -> Path:
     items = sorted(paths, key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
     names = [(path, path.name.casefold()) for path in items]
-    token_bark = "гав"
-    token_guitar = "гитар"
-    token_sound_a = "звук_а"
-    token_sound_i = "звук_и"
-    token_long_a = "ааа"
+    token_bark = "\u0433\u0430\u0432"
+    token_guitar = "\u0433\u0438\u0442\u0430\u0440"
+    token_sound_a = "\u0437\u0432\u0443\u043a_\u0430"
+    token_sound_i = "\u0437\u0432\u0443\u043a_\u0438"
+    token_long_a = "\u0430\u0430\u0430"
+
+    def prefer_original(matches: list[tuple[Path, str]]) -> list[Path]:
+        originals = [path for path, name in matches if not name.startswith("voice_")]
+        generated = [path for path, name in matches if name.startswith("voice_")]
+        return originals + generated
+
     if kind == "a":
-        exact = [path for path, name in names if token_long_a in name or "voice_a" in name]
+        exact = prefer_original([(path, name) for path, name in names if token_long_a in name or "voice_a" in name])
         if exact:
             return exact[0]
-        fallback = [
-            path
+        fallback = prefer_original([
+            (path, name)
             for path, name in names
             if (token_sound_a in name or "voice_a" in name)
             and token_bark not in name
@@ -75,18 +81,18 @@ def select_source(paths: list[Path], kind: str) -> Path:
             and "guitar" not in name
             and token_sound_i not in name
             and "voice_i" not in name
-        ]
+        ])
         if fallback:
             return fallback[0]
     if kind == "i":
-        exact = [path for path, name in names if token_sound_i in name or "sound_i" in name or "voice_i" in name]
+        exact = prefer_original([(path, name) for path, name in names if token_sound_i in name or "sound_i" in name or "voice_i" in name])
         if exact:
             return exact[0]
     if kind == "bark":
-        exact = [path for path, name in names if token_bark in name or "bark" in name or "voice_bark" in name]
+        exact = prefer_original([(path, name) for path, name in names if token_bark in name or "bark" in name or "voice_bark" in name])
         if exact:
             return exact[0]
-    raise FileNotFoundError(f"Не найден исходный файл для {kind}.")
+    raise FileNotFoundError(f"\u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0438\u0441\u0445\u043e\u0434\u043d\u044b\u0439 \u0444\u0430\u0439\u043b \u0434\u043b\u044f {kind}.")
 def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -530,10 +536,10 @@ def build_readme_pdf(root: Path, source_meta: dict[str, dict[str, str]], analyse
     y = draw1.textbbox((92, y), "Обработка голоса", font=load_font(40, bold=True))[3] + 18
     draw1.line((92, y, 1560, y), fill="#d6deea", width=2)
     y += 28
-    y = section(draw1, "Вариант 1: диапазон, тембр, форманты", y)
+    y = section(draw1, "Вариант 1. Голосовой диапазон, тембр, форманты", y)
     y = wrap_text(
         draw1,
-        "Для варианта 1 выполнены записи звуков А, И и имитации лая. Каждая запись переведена в монофонический WAV, после чего выполнены построение спектрограмм, оценка диапазона основного тона, поиск наиболее тембрально насыщенного участка и измерение трёх сильнейших формант.",
+        "В соответствии с вариантом 1 выполнен анализ записей звуков А, И и имитации лая. Каждая запись переведена в монофонический WAV, после чего построены спектрограммы, найден диапазон основного тона, определён наиболее тембрально окрашенный основной тон и измерены три сильнейшие форманты.",
         92,
         y,
         1468,
@@ -617,7 +623,6 @@ def build_readme_pdf(root: Path, source_meta: dict[str, dict[str, str]], analyse
         "Для варианта 1 проанализированы записи звуков А, И и имитации лая.",
         "Для каждой записи найдены минимальная и максимальная частоты основного тона, а также окно с наибольшим числом выраженных обертонов.",
         "Форманты гласных А и И различаются и по порядку величин согласуются с теоретическими ориентирами из задания.",
-        "Отчёт самодостаточен: в нём приведены исходные записи, спектрограммы, спектральные огибающие, численные результаты и выводы.",
     ]
     for item in conclusions:
         draw3.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
