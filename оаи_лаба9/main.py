@@ -41,20 +41,19 @@ def ensure_dirs(paths: list[Path]) -> None:
 
 def find_guitar_source(search_dirs: list[Path]) -> Path:
     candidates: list[Path] = []
+    token_guitar = "гитар"
     for directory in search_dirs:
         if not directory.exists():
             continue
         for path in directory.iterdir():
             if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
                 name = path.name.casefold()
-                if "гитары" in name or "guitar" in name:
+                if token_guitar in name or "guitar" in name:
                     candidates.append(path)
     if not candidates:
         raise FileNotFoundError("Не найден файл записи гитары.")
     candidates.sort(key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
     return candidates[0]
-
-
 def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     process = subprocess.run(

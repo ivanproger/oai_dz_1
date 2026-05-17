@@ -56,32 +56,37 @@ def audio_files(search_dirs: list[Path]) -> list[Path]:
 def select_source(paths: list[Path], kind: str) -> Path:
     items = sorted(paths, key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
     names = [(path, path.name.casefold()) for path in items]
+    token_bark = "гав"
+    token_guitar = "гитар"
+    token_sound_a = "звук_а"
+    token_sound_i = "звук_и"
+    token_long_a = "ааа"
     if kind == "a":
-        exact = [path for path, name in names if "??????" in name or "voice_a" in name]
+        exact = [path for path, name in names if token_long_a in name or "voice_a" in name]
         if exact:
             return exact[0]
         fallback = [
             path
             for path, name in names
-            if ("????????_??" in name or "voice_a" in name)
-            and "??????" not in name
+            if (token_sound_a in name or "voice_a" in name)
+            and token_bark not in name
             and "bark" not in name
-            and "??????????" not in name
+            and token_guitar not in name
             and "guitar" not in name
-            and "????????_??" not in name
+            and token_sound_i not in name
             and "voice_i" not in name
         ]
         if fallback:
             return fallback[0]
     if kind == "i":
-        exact = [path for path, name in names if "????????_??" in name or "sound_i" in name or "voice_i" in name]
+        exact = [path for path, name in names if token_sound_i in name or "sound_i" in name or "voice_i" in name]
         if exact:
             return exact[0]
     if kind == "bark":
-        exact = [path for path, name in names if "??????" in name or "bark" in name or "voice_bark" in name]
+        exact = [path for path, name in names if token_bark in name or "bark" in name or "voice_bark" in name]
         if exact:
             return exact[0]
-    raise FileNotFoundError(f"???? ???????????? ???????????????? ???????? ?????? {kind}.")
+    raise FileNotFoundError(f"Не найден исходный файл для {kind}.")
 def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
