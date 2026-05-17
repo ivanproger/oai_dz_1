@@ -1,4 +1,4 @@
-﻿image;con_before;lun_before;con_after;lun_after
-phrase_soft;1.918624;0.983772;1.272308;0.970433
-alphabet_parchment;1.352487;0.979772;1.070904;0.949969
-phrase_pattern;1.851582;0.970998;1.503936;0.917046
+﻿image;display_name;con_before;lun_before;con_after;lun_after
+phrase_soft;Фраза на светлом фоне;380.228444;0.020600;383.511866;0.020713
+alphabet_parchment;Алфавит на пергаментном фоне;139.830191;0.014520;281.056474;0.014642
+phrase_pattern;Смешанная композиция;298.954864;0.007861;322.426111;0.007989

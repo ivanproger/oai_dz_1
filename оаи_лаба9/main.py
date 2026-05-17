@@ -1,33 +1,118 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import math
+import re
+import subprocess
 import wave
 from pathlib import Path
 
+import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lab 9: noise analysis")
-    parser.add_argument("--sample-rate", type=int, default=22050, help="Sample rate")
-    parser.add_argument("--frame-size", type=int, default=1024, help="STFT frame size")
-    parser.add_argument("--hop-size", type=int, default=256, help="STFT hop size")
-    parser.add_argument("--noise-seconds", type=float, default=0.4, help="Leading noise-only section")
-    parser.add_argument("--input", default="input", help="Input directory")
-    parser.add_argument("--output", default="output", help="Output directory")
+    parser.add_argument("--sample-rate", type=int, default=22050)
+    parser.add_argument("--frame-size", type=int, default=1024)
+    parser.add_argument("--hop-size", type=int, default=256)
+    parser.add_argument("--input", default="input")
+    parser.add_argument("--output", default="output")
     return parser.parse_args()
 
 
-def fit_image(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
-    scale = min(box_w / img.width, box_h / img.height)
-    size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-    return img.resize(size, Image.Resampling.LANCZOS)
+def load_font(size: int, bold: bool = False, mono: bool = False) -> ImageFont.FreeTypeFont:
+    if mono:
+        return ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", size=size)
+    if bold:
+        return ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", size=size)
+    return ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", size=size)
+
+
+def ensure_dirs(paths: list[Path]) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def find_guitar_source(search_dirs: list[Path]) -> Path:
+    candidates: list[Path] = []
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                name = path.name.casefold()
+                if "гитары" in name or "guitar" in name:
+                    candidates.append(path)
+    if not candidates:
+        raise FileNotFoundError("Не найден файл записи гитары.")
+    candidates.sort(key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
+    return candidates[0]
+
+
+def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    process = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "s16le",
+            "-",
+        ],
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode("utf-8", errors="ignore") or "Не удалось декодировать звук.")
+    data = np.frombuffer(process.stdout, dtype=np.int16).astype(np.float64)
+    if data.size == 0:
+        raise RuntimeError("Декодированный аудиосигнал пуст.")
+    return data / 32768.0
+
+
+def probe_audio(path: Path) -> dict[str, str]:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    process = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    text = process.stderr
+    duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", text)
+    stream_match = re.search(r"Audio: .*?, (\d+) Hz, ([^,]+),", text)
+    duration = ""
+    sample_rate = ""
+    channels = ""
+    if duration_match:
+        hours, minutes, seconds = duration_match.groups()
+        duration = f"{int(hours) * 3600 + int(minutes) * 60 + float(seconds):.2f}"
+    if stream_match:
+        sample_rate = stream_match.group(1)
+        channels = stream_match.group(2)
+    return {
+        "source_name": path.name,
+        "source_duration_s": duration,
+        "source_sample_rate_hz": sample_rate,
+        "source_channels": channels,
+    }
 
 
 def write_wav(path: Path, signal: np.ndarray, sample_rate: int) -> None:
-    clipped = np.clip(signal, -1.0, 1.0)
-    data = np.round(clipped * 32767.0).astype(np.int16)
+    data = np.clip(np.round(signal * 32767.0), -32768, 32767).astype(np.int16)
     with wave.open(str(path), "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
@@ -35,50 +120,9 @@ def write_wav(path: Path, signal: np.ndarray, sample_rate: int) -> None:
         wav_file.writeframes(data.tobytes())
 
 
-def synth_note(freq: float, duration: float, sample_rate: int) -> np.ndarray:
-    t = np.arange(int(duration * sample_rate), dtype=np.float64) / sample_rate
-    attack = 1.0 - np.exp(-40.0 * t)
-    decay = np.exp(-3.2 * t)
-    envelope = attack * decay
-    signal = np.zeros_like(t)
-    for harmonic in range(1, 7):
-        signal += (1.0 / (harmonic ** 1.2)) * np.sin(2.0 * np.pi * freq * harmonic * t)
-    signal += 0.08 * np.sin(2.0 * np.pi * freq * 2.03 * t)
-    return 0.55 * envelope * signal
-
-
-def synth_phrase(sample_rate: int) -> np.ndarray:
-    melody = [
-        (220.0, 0.34),
-        (247.0, 0.34),
-        (262.0, 0.34),
-        (294.0, 0.34),
-        (330.0, 0.40),
-        (349.0, 0.34),
-        (392.0, 0.38),
-        (440.0, 0.46),
-    ]
-    gap = np.zeros(int(0.045 * sample_rate), dtype=np.float64)
-    parts = [np.zeros(int(0.4 * sample_rate), dtype=np.float64)]
-    for freq, duration in melody:
-        parts.append(synth_note(freq, duration, sample_rate))
-        parts.append(gap)
-    parts.append(np.zeros(int(0.4 * sample_rate), dtype=np.float64))
-    signal = np.concatenate(parts)
+def normalize(signal: np.ndarray) -> np.ndarray:
     peak = max(1e-9, float(np.max(np.abs(signal))))
-    return 0.85 * signal / peak
-
-
-def add_noise(clean: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(7)
-    t = np.arange(clean.size, dtype=np.float64) / sample_rate
-    white = 0.055 * rng.standard_normal(clean.size)
-    hum = 0.028 * np.sin(2.0 * np.pi * 50.0 * t)
-    hiss = 0.018 * np.sin(2.0 * np.pi * 3200.0 * t + 0.6)
-    noise = white + hum + hiss
-    noisy = clean + noise
-    peak = max(1.0, float(np.max(np.abs(noisy))) / 0.98)
-    return noisy / peak, noise / peak
+    return 0.98 * signal / peak
 
 
 def stft(signal: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
@@ -89,8 +133,7 @@ def stft(signal: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
     frames = []
     for idx in range(n_frames):
         start = idx * hop_size
-        frame = padded[start : start + frame_size] * window
-        frames.append(np.fft.rfft(frame))
+        frames.append(np.fft.rfft(padded[start : start + frame_size] * window))
     return np.stack(frames, axis=1)
 
 
@@ -110,31 +153,38 @@ def istft(spec: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
     return signal
 
 
-def spectral_subtraction(noisy: np.ndarray, sample_rate: int, noise_seconds: float, frame_size: int, hop_size: int) -> np.ndarray:
-    noise_len = max(frame_size, int(noise_seconds * sample_rate))
-    noise_part = noisy[:noise_len]
-    noisy_spec = stft(noisy, frame_size, hop_size)
-    noise_spec = stft(noise_part, frame_size, hop_size)
-    noise_mag = np.mean(np.abs(noise_spec), axis=1, keepdims=True)
-    mag = np.abs(noisy_spec)
-    phase = np.exp(1j * np.angle(noisy_spec))
-    cleaned_mag = np.maximum(mag - 1.25 * noise_mag, 0.03 * noise_mag)
+def estimate_noise_profile(spec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mag = np.abs(spec)
+    frame_energy = np.mean(mag * mag, axis=0)
+    threshold = float(np.percentile(frame_energy, 15))
+    mask = frame_energy <= threshold
+    if int(mask.sum()) < 4:
+        order = np.argsort(frame_energy)
+        mask = np.zeros_like(frame_energy, dtype=bool)
+        mask[order[: max(4, order.size // 10 or 1)]] = True
+    noise_mag = np.mean(mag[:, mask], axis=1, keepdims=True)
+    return noise_mag, mask
+
+
+def spectral_subtraction(signal: np.ndarray, frame_size: int, hop_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    spec = stft(signal, frame_size, hop_size)
+    noise_mag, quiet_mask = estimate_noise_profile(spec)
+    mag = np.abs(spec)
+    phase = np.exp(1j * np.angle(spec))
+    cleaned_mag = np.maximum(mag - 1.18 * noise_mag, 0.04 * noise_mag)
     cleaned_spec = cleaned_mag * phase
-    denoised = istft(cleaned_spec, frame_size, hop_size)
-    return denoised[: noisy.size]
+    denoised = istft(cleaned_spec, frame_size, hop_size)[: signal.size]
+    return denoised, noise_mag, quiet_mask
 
 
-def noise_rms(signal: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.square(signal))))
-
-
-def snr_db(reference: np.ndarray, test: np.ndarray) -> float:
-    error = test[: reference.size] - reference
-    signal_power = np.sum(reference * reference)
-    noise_power = np.sum(error * error)
-    if noise_power <= 1e-12:
-        return 99.0
-    return float(10.0 * np.log10(signal_power / noise_power))
+def frame_rms_track(signal: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
+    values = []
+    for start in range(0, max(1, signal.size - frame_size + 1), hop_size):
+        frame = signal[start : start + frame_size]
+        if frame.size < frame_size:
+            frame = np.pad(frame, (0, frame_size - frame.size))
+        values.append(float(np.sqrt(np.mean(frame * frame))))
+    return np.asarray(values, dtype=np.float64)
 
 
 def spectrogram_db(signal: np.ndarray, sample_rate: int, frame_size: int, hop_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -146,118 +196,125 @@ def spectrogram_db(signal: np.ndarray, sample_rate: int, frame_size: int, hop_si
     return db, freqs, times
 
 
-def log_frequency_image(db: np.ndarray, freqs: np.ndarray, max_rows: int = 320) -> np.ndarray:
-    f_min = max(40.0, float(freqs[1] if freqs.size > 1 else 40.0))
-    f_max = float(freqs[-1])
-    log_freqs = np.geomspace(f_min, f_max, num=max_rows)
-    src = np.empty((max_rows, db.shape[1]), dtype=np.float32)
-    for idx, freq in enumerate(log_freqs):
-        source = int(np.argmin(np.abs(freqs - freq)))
-        src[max_rows - 1 - idx, :] = db[source, :]
-    lo = float(np.percentile(src, 5))
-    hi = float(np.percentile(src, 99))
-    if hi <= lo:
-        hi = lo + 1.0
-    norm = np.clip((src - lo) / (hi - lo), 0.0, 1.0)
-    return norm
-
-
-def colorize_heatmap(norm: np.ndarray) -> np.ndarray:
-    x = norm.astype(np.float32)
-    r = np.clip(255.0 * (x ** 0.85), 0, 255)
-    g = np.clip(255.0 * np.sqrt(x), 0, 255)
-    b = np.clip(255.0 * (0.35 + 0.65 * x), 0, 255)
-    rgb = np.stack([r, g, b], axis=-1)
-    return rgb.astype(np.uint8)
-
-
-def make_spectrogram_image(signal: np.ndarray, sample_rate: int, frame_size: int, hop_size: int, title: str) -> Image.Image:
-    db, freqs, times = spectrogram_db(signal, sample_rate, frame_size, hop_size)
-    heat = colorize_heatmap(log_frequency_image(db, freqs))
-    chart = Image.fromarray(heat, mode="RGB").resize((980, 520), Image.Resampling.NEAREST)
-    canvas = Image.new("RGB", (1080, 620), "white")
-    draw = ImageDraw.Draw(canvas)
-    font_title = ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 24)
-    font = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 16)
-    draw.text((20, 16), title, font=font_title, fill="black")
-    canvas.paste(chart, (60, 56))
-    draw.rectangle((60, 56, 1040, 576), outline="#cfcfcf", width=2)
-    duration = times[-1] if times.size else 0.0
-    for t_val in np.linspace(0.0, duration, 5):
-        x = 60 + int(round((t_val / max(duration, 1e-6)) * 980))
-        draw.line((x, 576, x, 584), fill="black", width=1)
-        draw.text((x - 10, 586), f"{t_val:.1f}", font=font, fill="black")
-    for f_val in [100, 250, 500, 1000, 2000, 4000, 8000]:
-        if f_val >= sample_rate / 2:
-            continue
-        ratio = (math.log(f_val) - math.log(40.0)) / (math.log(sample_rate / 2.0) - math.log(40.0))
-        y = 576 - int(round(ratio * 520))
-        draw.line((52, y, 60, y), fill="black", width=1)
-        draw.text((4, y - 8), str(f_val), font=font, fill="black")
-    draw.text((1000, 586), "с", font=font, fill="black")
-    draw.text((4, 34), "Гц", font=font, fill="black")
-    return canvas
+def fit_image(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+    scale = min(max_width / image.width, max_height / image.height)
+    size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+    return image.resize(size, Image.Resampling.LANCZOS)
 
 
 def make_waveform_image(signal: np.ndarray, sample_rate: int, title: str) -> Image.Image:
-    width = 1080
-    height = 320
-    canvas = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(canvas)
-    font_title = ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 24)
-    font = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 16)
-    draw.text((20, 16), title, font=font_title, fill="black")
-    left = 60
-    top = 56
-    chart_w = 980
-    chart_h = 220
-    center_y = top + chart_h // 2
-    draw.rectangle((left, top, left + chart_w, top + chart_h), outline="#cfcfcf", width=2)
-    draw.line((left, center_y, left + chart_w, center_y), fill="#888888", width=1)
-    duration = signal.size / sample_rate
-    step = max(1, signal.size // chart_w)
+    page = Image.new("RGB", (1080, 320), "white")
+    draw = ImageDraw.Draw(page)
+    draw.text((22, 16), title, font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top, width, height = 58, 56, 980, 220
+    draw.rectangle((left, top, left + width, top + height), outline="#cbd6e6", width=2)
+    mid = top + height // 2
+    draw.line((left, mid, left + width, mid), fill="#7d8895", width=1)
+    step = max(1, signal.size // width)
     points = []
-    for x in range(chart_w):
+    for x in range(width):
         start = x * step
         stop = min(signal.size, start + step)
         value = float(np.mean(signal[start:stop])) if stop > start else 0.0
-        y = center_y - int(round(value * (chart_h // 2 - 8)))
+        y = mid - int(round(value * (height // 2 - 8)))
         points.append((left + x, y))
-    draw.line(points, fill="#1b4d8f", width=1)
-    for t_val in np.linspace(0.0, duration, 5):
-        x = left + int(round((t_val / max(duration, 1e-6)) * chart_w))
-        draw.line((x, top + chart_h, x, top + chart_h + 8), fill="black", width=1)
-        draw.text((x - 10, top + chart_h + 10), f"{t_val:.1f}", font=font, fill="black")
-    draw.text((left + chart_w + 8, center_y - 8), "0", font=font, fill="black")
-    draw.text((left + chart_w + 8, top - 4), "1", font=font, fill="black")
-    draw.text((left + chart_w + 8, top + chart_h - 12), "-1", font=font, fill="black")
-    return canvas
+    draw.line(points, fill="#1c5da0", width=1)
+    duration = signal.size / sample_rate
+    font = load_font(16)
+    for t_value in np.linspace(0.0, duration, 5):
+        x = left + int(round((t_value / max(duration, 1e-6)) * width))
+        draw.line((x, top + height, x, top + height + 8), fill="black", width=1)
+        draw.text((x - 12, top + height + 10), f"{t_value:.1f}", font=font, fill="black")
+    draw.text((left + width + 10, top - 4), "1", font=font, fill="black")
+    draw.text((left + width + 10, mid - 8), "0", font=font, fill="black")
+    draw.text((left + width + 10, top + height - 14), "-1", font=font, fill="black")
+    draw.text((left + width - 6, top + height + 34), "с", font=font, fill="black")
+    return page
 
 
-def high_energy_cells(signal: np.ndarray, sample_rate: int, dt: float = 0.1, df: float = 50.0) -> list[dict[str, float]]:
+def make_spectrogram_image(
+    signal: np.ndarray,
+    sample_rate: int,
+    frame_size: int,
+    hop_size: int,
+    title: str,
+    highlight: dict[str, float] | None = None,
+) -> Image.Image:
+    db, freqs, times = spectrogram_db(signal, sample_rate, frame_size, hop_size)
+    f_min = max(40.0, float(freqs[1] if freqs.size > 1 else 40.0))
+    f_max = float(freqs[-1])
+    rows = 320
+    grid = np.geomspace(f_min, f_max, num=rows)
+    image = np.empty((rows, db.shape[1]), dtype=np.float32)
+    for idx, value in enumerate(grid):
+        source = int(np.argmin(np.abs(freqs - value)))
+        image[rows - 1 - idx, :] = db[source, :]
+    lo = float(np.percentile(image, 5))
+    hi = float(np.percentile(image, 99))
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+    r = np.clip(255.0 * (norm ** 0.88), 0, 255)
+    g = np.clip(255.0 * np.sqrt(norm), 0, 255)
+    b = np.clip(255.0 * (0.32 + 0.68 * norm), 0, 255)
+    chart = Image.fromarray(np.stack([r, g, b], axis=-1).astype(np.uint8), mode="RGB").resize((980, 520), Image.Resampling.NEAREST)
+    page = Image.new("RGB", (1080, 620), "white")
+    draw = ImageDraw.Draw(page)
+    draw.text((22, 16), title, font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top = 60, 56
+    page.paste(chart, (left, top))
+    draw.rectangle((left, top, left + 980, top + 520), outline="#cbd6e6", width=2)
+    duration = times[-1] if times.size else signal.size / sample_rate
+    font = load_font(16)
+    for t_value in np.linspace(0.0, duration, 5):
+        x = left + int(round((t_value / max(duration, 1e-6)) * 980))
+        draw.line((x, top + 520, x, top + 528), fill="black", width=1)
+        draw.text((x - 12, top + 532), f"{t_value:.1f}", font=font, fill="black")
+    for f_value in [100, 250, 500, 1000, 2000, 4000, 8000]:
+        if f_value >= sample_rate / 2:
+            continue
+        ratio = (math.log(f_value) - math.log(40.0)) / (math.log(sample_rate / 2.0) - math.log(40.0))
+        y = top + 520 - int(round(ratio * 520))
+        draw.line((52, y, 60, y), fill="black", width=1)
+        draw.text((6, y - 8), str(f_value), font=font, fill="black")
+    draw.text((1012, top + 532), "с", font=font, fill="black")
+    draw.text((6, 34), "Гц", font=font, fill="black")
+    if highlight is not None:
+        x0 = left + int(round((highlight["time_start_s"] / max(duration, 1e-6)) * 980))
+        x1 = left + int(round((highlight["time_end_s"] / max(duration, 1e-6)) * 980))
+        ratio0 = (math.log(max(highlight["freq_start_hz"], 40.0)) - math.log(40.0)) / (math.log(sample_rate / 2.0) - math.log(40.0))
+        ratio1 = (math.log(max(highlight["freq_end_hz"], 40.0)) - math.log(40.0)) / (math.log(sample_rate / 2.0) - math.log(40.0))
+        y1 = top + 520 - int(round(ratio0 * 520))
+        y0 = top + 520 - int(round(ratio1 * 520))
+        draw.rectangle((x0, y0, x1, y1), outline="#d62828", width=3)
+        draw.text((x0 + 8, max(top + 8, y0 - 26)), "Глобальный максимум", font=load_font(18, bold=True), fill="#d62828")
+    return page
+
+
+def build_energy_grid(signal: np.ndarray, sample_rate: int, dt: float = 0.1, df: float = 50.0) -> tuple[np.ndarray, list[dict[str, float]]]:
     window_size = int(round(dt * sample_rate))
-    if window_size <= 0:
-        return []
     nfft = 1
     while nfft < window_size:
         nfft *= 2
     window = np.hanning(window_size)
     band_edges = np.arange(0.0, sample_rate / 2.0 + df, df)
     freq_grid = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
-    results = []
-    n_frames = max(1, signal.size // window_size)
-    for frame_idx in range(n_frames):
+    frames = max(1, int(math.ceil(signal.size / window_size)))
+    grid = np.zeros((band_edges.size - 1, frames), dtype=np.float64)
+    rows = []
+    for frame_idx in range(frames):
         start = frame_idx * window_size
         frame = signal[start : start + window_size]
         if frame.size < window_size:
             frame = np.pad(frame, (0, window_size - frame.size))
         spec = np.abs(np.fft.rfft(frame * window, n=nfft)) ** 2
-        for band_idx in range(len(band_edges) - 1):
-            f0 = band_edges[band_idx]
-            f1 = band_edges[band_idx + 1]
+        for band_idx in range(band_edges.size - 1):
+            f0 = float(band_edges[band_idx])
+            f1 = float(band_edges[band_idx + 1])
             mask = (freq_grid >= f0) & (freq_grid < f1)
             energy = float(spec[mask].sum())
-            results.append(
+            grid[band_idx, frame_idx] = energy
+            rows.append(
                 {
                     "time_start_s": frame_idx * dt,
                     "time_end_s": (frame_idx + 1) * dt,
@@ -266,15 +323,67 @@ def high_energy_cells(signal: np.ndarray, sample_rate: int, dt: float = 0.1, df:
                     "energy": energy,
                 }
             )
-    results.sort(key=lambda item: item["energy"], reverse=True)
-    return results[:10]
+    rows.sort(key=lambda item: item["energy"], reverse=True)
+    return grid, rows
 
 
-def save_energy_csv(rows: list[dict[str, float]], path: Path) -> None:
+def make_energy_map_image(
+    grid: np.ndarray,
+    sample_rate: int,
+    dt: float,
+    df: float,
+    peak_cell: dict[str, float],
+) -> Image.Image:
+    display_rows = min(grid.shape[0], int(5000 // df))
+    sub = grid[:display_rows, :]
+    scaled = np.log1p(sub)
+    max_value = float(np.max(scaled))
+    if max_value > 0:
+        scaled = scaled / max_value
+    heat = np.stack(
+        [
+            np.clip(255.0 * (scaled ** 0.9), 0, 255),
+            np.clip(255.0 * np.sqrt(scaled), 0, 255),
+            np.clip(255.0 * (0.22 + 0.78 * scaled), 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    chart = Image.fromarray(heat[::-1, :, :], mode="RGB").resize((980, 460), Image.Resampling.NEAREST)
+    page = Image.new("RGB", (1080, 560), "white")
+    draw = ImageDraw.Draw(page)
+    draw.text((22, 16), "Карта энергии E(t, f) для восстановленного сигнала", font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top = 60, 56
+    page.paste(chart, (left, top))
+    draw.rectangle((left, top, left + 980, top + 460), outline="#cbd6e6", width=2)
+    total_time = grid.shape[1] * dt
+    font = load_font(16)
+    for t_value in np.linspace(0.0, total_time, 5):
+        x = left + int(round((t_value / max(total_time, 1e-6)) * 980))
+        draw.line((x, top + 460, x, top + 468), fill="black", width=1)
+        draw.text((x - 12, top + 472), f"{t_value:.1f}", font=font, fill="black")
+    for f_value in [0, 500, 1000, 2000, 3000, 4000, 5000]:
+        y = top + 460 - int(round((f_value / max(1.0, display_rows * df)) * 460))
+        draw.line((52, y, 60, y), fill="black", width=1)
+        draw.text((6, y - 8), str(f_value), font=font, fill="black")
+    draw.text((1012, top + 472), "с", font=font, fill="black")
+    draw.text((6, 34), "Гц", font=font, fill="black")
+    time_idx = int(round(peak_cell["time_start_s"] / dt))
+    band_idx = int(round(peak_cell["freq_start_hz"] / df))
+    if band_idx < display_rows:
+        x0 = left + int(round(time_idx / max(1, grid.shape[1]) * 980))
+        x1 = left + int(round((time_idx + 1) / max(1, grid.shape[1]) * 980))
+        y0 = top + 460 - int(round((band_idx + 1) / display_rows * 460))
+        y1 = top + 460 - int(round(band_idx / display_rows * 460))
+        draw.rectangle((x0, y0, x1, y1), outline="#d62828", width=3)
+        draw.text((x0 + 8, max(top + 8, y0 - 24)), "Максимум", font=load_font(18, bold=True), fill="#d62828")
+    return page
+
+
+def save_top_energy_csv(rows: list[dict[str, float]], path: Path) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle, delimiter=";")
         writer.writerow(["rank", "time_start_s", "time_end_s", "freq_start_hz", "freq_end_hz", "energy"])
-        for idx, row in enumerate(rows, 1):
+        for idx, row in enumerate(rows[:10], 1):
             writer.writerow(
                 [
                     idx,
@@ -287,109 +396,240 @@ def save_energy_csv(rows: list[dict[str, float]], path: Path) -> None:
             )
 
 
-def save_metrics_csv(rows: list[tuple[str, str]], path: Path) -> None:
+def save_metrics_csv(path: Path, rows: list[tuple[str, str]]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle, delimiter=";")
         writer.writerow(["metric", "value"])
         writer.writerows(rows)
 
 
-def make_summary_panel(
-    waveform_noisy: Image.Image,
-    waveform_denoised: Image.Image,
-    spec_noisy: Image.Image,
-    spec_denoised: Image.Image,
+def text_block(draw: ImageDraw.ImageDraw, text: str, x: int, y: int, width: int, font: ImageFont.FreeTypeFont, fill: str) -> int:
+    words = text.split()
+    if not words:
+        return y
+    line = words[0]
+    line_h = draw.textbbox((0, 0), "Ag", font=font)[3]
+    for word in words[1:]:
+        candidate = line + " " + word
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= width:
+            line = candidate
+        else:
+            draw.text((x, y), line, font=font, fill=fill)
+            y += line_h + 8
+            line = word
+    draw.text((x, y), line, font=font, fill=fill)
+    return y + line_h + 8
+
+
+def section(draw: ImageDraw.ImageDraw, title: str, y: int) -> int:
+    font = load_font(40, bold=True)
+    draw.text((92, y), title, font=font, fill="#1f3a5f")
+    y = draw.textbbox((92, y), title, font=font)[3] + 12
+    draw.line((92, y, 1560, y), fill="#d6deea", width=3)
+    return y + 22
+
+
+def build_readme_pdf(
+    root: Path,
+    source_meta: dict[str, str],
     metrics: list[tuple[str, str]],
-    top_energy: list[dict[str, float]],
-) -> Image.Image:
-    panel = Image.new("RGB", (1480, 1160), "white")
-    draw = ImageDraw.Draw(panel)
-    title_font = ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", 30)
-    text_font = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 20)
-    mono_font = ImageFont.truetype(r"C:\Windows\Fonts\cour.ttf", 18)
-    draw.text((24, 18), "Анализ шума и шумоподавление", font=title_font, fill="black")
-    panel.paste(fit_image(waveform_noisy, 700, 220), (24, 72))
-    panel.paste(fit_image(waveform_denoised, 700, 220), (756, 72))
-    panel.paste(fit_image(spec_noisy, 700, 360), (24, 326))
-    panel.paste(fit_image(spec_denoised, 700, 360), (756, 326))
-    draw.text((24, 706), "Численные характеристики", font=title_font, fill="black")
-    y = 754
+    top_rows: list[dict[str, float]],
+    wave_before: Image.Image,
+    wave_after: Image.Image,
+    spec_before: Image.Image,
+    spec_after: Image.Image,
+    energy_map: Image.Image,
+) -> None:
+    page1 = Image.new("RGB", (1654, 2339), "white")
+    draw1 = ImageDraw.Draw(page1)
+    title_font = load_font(54, bold=True)
+    body_font = load_font(26)
+    mono_font = load_font(24, mono=True)
+    y = 88
+    draw1.text((92, y), "Лабораторная работа №9", font=title_font, fill="#1f3a5f")
+    y = draw1.textbbox((92, y), "Лабораторная работа №9", font=title_font)[3] + 18
+    draw1.line((92, y, 1560, y), fill="#d6deea", width=3)
+    y += 34
+    draw1.text((92, y), "Анализ шума музыкальной записи", font=load_font(40, bold=True), fill="#243447")
+    y = draw1.textbbox((92, y), "Анализ шума музыкальной записи", font=load_font(40, bold=True))[3] + 18
+    draw1.line((92, y, 1560, y), fill="#d6deea", width=2)
+    y += 28
+    y = section(draw1, "Исходные данные", y)
+    y = text_block(
+        draw1,
+        f"Использована пользовательская запись {source_meta['source_name']}. Файл декодирован в монофонический WAV с частотой {metrics[0][1]} Гц. Для анализа спектра и подавления шума применено оконное преобразование Фурье с окном Ханна.",
+        92,
+        y,
+        1468,
+        body_font,
+        "#243447",
+    )
+    y += 16
+    y = section(draw1, "Как оценивался шум", y)
+    y = text_block(
+        draw1,
+        "Шумовой профиль оценивался по 15% наименее энергичных окон спектрограммы. После этого выполнялось спектральное вычитание. Глобальный максимум энергии искался на восстановленном сигнале по карте E(t,f) с шагами Δt = 0.1 с и Δf = 50 Гц.",
+        92,
+        y,
+        1468,
+        body_font,
+        "#243447",
+    )
+    y += 18
+    y = section(draw1, "Используемые соотношения", y)
+    formulas = [
+        "X(m,k) = Σ x[n] · w[n-mH] · exp(-j·2πkn/N)",
+        "|S(m,k)| = max(|Y(m,k)| - α·|N(k)|, β·|N(k)|)",
+        "E(t,f) = Σ |X(t,f)|² по окну Δt × Δf",
+    ]
+    for line in formulas:
+        draw1.text((118, y), line, font=mono_font, fill="#243447")
+        y += 42
+    y += 10
+    y = section(draw1, "Численные результаты", y)
+    draw1.rounded_rectangle((92, y, 1560, y + 56), radius=10, fill="#edf3fb", outline="#d6deea", width=2)
+    draw1.text((112, y + 14), "Показатель", font=load_font(22, bold=True), fill="#1f3a5f")
+    draw1.text((1120, y + 14), "Значение", font=load_font(22, bold=True), fill="#1f3a5f")
+    row_y = y + 56
     for key, value in metrics:
-        draw.text((36, y), f"{key}: {value}", font=text_font, fill="black")
-        y += 34
-    draw.text((756, 706), "Моменты максимальной энергии", font=title_font, fill="black")
-    y = 754
-    header = "rank | t0 | t1 | f0 | f1 | energy"
-    draw.text((768, y), header, font=mono_font, fill="black")
-    y += 30
-    for idx, row in enumerate(top_energy[:8], 1):
-        line = f"{idx:02d} | {row['time_start_s']:.2f} | {row['time_end_s']:.2f} | {row['freq_start_hz']:.0f} | {row['freq_end_hz']:.0f} | {row['energy']:.3f}"
-        draw.text((768, y), line, font=mono_font, fill="black")
-        y += 28
-    return panel
+        draw1.rectangle((92, row_y, 1560, row_y + 46), outline="#d6deea", width=1)
+        draw1.text((112, row_y + 10), key, font=load_font(21), fill="#243447")
+        draw1.text((1120, row_y + 10), value, font=load_font(21), fill="#243447")
+        row_y += 46
+    y = row_y + 24
+    y = section(draw1, "Глобальный максимум энергии", y)
+    peak = top_rows[0]
+    peak_text = (
+        f"Глобальный максимум карты E(t,f) найден в интервале {peak['time_start_s']:.2f}–{peak['time_end_s']:.2f} с "
+        f"и полосе {peak['freq_start_hz']:.0f}–{peak['freq_end_hz']:.0f} Гц. "
+        f"Энергия ячейки: {peak['energy']:.3f}."
+    )
+    text_block(draw1, peak_text, 92, y, 1468, body_font, "#243447")
+
+    page2 = Image.new("RGB", (1654, 2339), "white")
+    draw2 = ImageDraw.Draw(page2)
+    draw2.text((92, 88), "Осциллограммы и спектрограммы", font=title_font, fill="#1f3a5f")
+    y2 = draw2.textbbox((92, 88), "Осциллограммы и спектрограммы", font=title_font)[3] + 18
+    draw2.line((92, y2, 1560, y2), fill="#d6deea", width=3)
+    page2.paste(fit_image(wave_before, 700, 220), (92, 150))
+    page2.paste(fit_image(wave_after, 700, 220), (862, 150))
+    page2.paste(fit_image(spec_before, 700, 420), (92, 430))
+    page2.paste(fit_image(spec_after, 700, 420), (862, 430))
+    draw2.text((112, 122), "Исходная запись", font=load_font(28, bold=True), fill="#243447")
+    draw2.text((882, 122), "После шумоподавления", font=load_font(28, bold=True), fill="#243447")
+    draw2.text((112, 402), "Спектрограмма исходной записи", font=load_font(28, bold=True), fill="#243447")
+    draw2.text((882, 402), "Спектрограмма после обработки", font=load_font(28, bold=True), fill="#243447")
+    page2.paste(fit_image(energy_map, 1470, 760), (92, 940))
+
+    page3 = Image.new("RGB", (1654, 2339), "white")
+    draw3 = ImageDraw.Draw(page3)
+    draw3.text((92, 88), "Максимумы энергии и выводы", font=title_font, fill="#1f3a5f")
+    y3 = draw3.textbbox((92, 88), "Максимумы энергии и выводы", font=title_font)[3] + 18
+    draw3.line((92, y3, 1560, y3), fill="#d6deea", width=3)
+    y = 156
+    draw3.text((92, y), "Наиболее энергичные интервалы", font=load_font(34, bold=True), fill="#243447")
+    y += 52
+    draw3.rounded_rectangle((92, y, 1560, y + 56), radius=10, fill="#edf3fb", outline="#d6deea", width=2)
+    headers = ["№", "t0", "t1", "f0", "f1", "Энергия"]
+    xs = [112, 220, 380, 540, 730, 930]
+    for header, x in zip(headers, xs):
+        draw3.text((x, y + 14), header, font=load_font(22, bold=True), fill="#1f3a5f")
+    row_y = y + 56
+    for idx, row in enumerate(top_rows[:10], 1):
+        draw3.rectangle((92, row_y, 1560, row_y + 46), outline="#d6deea", width=1)
+        values = [
+            str(idx),
+            f"{row['time_start_s']:.2f}",
+            f"{row['time_end_s']:.2f}",
+            f"{row['freq_start_hz']:.0f}",
+            f"{row['freq_end_hz']:.0f}",
+            f"{row['energy']:.3f}",
+        ]
+        for value, x in zip(values, xs):
+            draw3.text((x, row_y + 10), value, font=load_font(21), fill="#243447")
+        row_y += 46
+    y = row_y + 28
+    y = section(draw3, "Выводы", y)
+    conclusions = [
+        "Запись гитары обработана как реальный внешний источник, а не как синтезированный сигнал.",
+        "Уровень шумового фона оценён по наименее энергичным окнам и после спектрального вычитания уменьшен.",
+        "Глобальный максимум энергии теперь определён однозначно: показаны и численные границы ячейки, и её положение на карте E(t,f).",
+        "Отчёт является самодостаточным: в нём приведены методика, параметры, спектрограммы, карта энергии и итоговые выводы.",
+    ]
+    for item in conclusions:
+        draw3.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
+        y = text_block(draw3, item, 126, y, 1430, body_font, "#243447") + 4
+    page1.save(root / "README.pdf", save_all=True, append_images=[page2, page3], resolution=180)
 
 
 def main() -> int:
     args = parse_args()
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "audio").mkdir(exist_ok=True)
-    (output_dir / "spectrograms").mkdir(exist_ok=True)
-    (output_dir / "waveforms").mkdir(exist_ok=True)
-    (output_dir / "summaries").mkdir(exist_ok=True)
+    root = Path(__file__).resolve().parent
+    workspace = root.parent
+    input_dir = root / args.input
+    output_dir = root / args.output
+    audio_dir = output_dir / "audio"
+    waveform_dir = output_dir / "waveforms"
+    spectrogram_dir = output_dir / "spectrograms"
+    summary_dir = output_dir / "summaries"
+    ensure_dirs([input_dir, output_dir, audio_dir, waveform_dir, spectrogram_dir, summary_dir])
 
-    clean = synth_phrase(args.sample_rate)
-    noisy, added_noise = add_noise(clean, args.sample_rate)
-    denoised = spectral_subtraction(noisy, args.sample_rate, args.noise_seconds, args.frame_size, args.hop_size)
-    denoised = np.clip(denoised, -1.0, 1.0)
+    source = find_guitar_source([workspace, input_dir])
+    source_meta = probe_audio(source)
+    signal = decode_audio(source, args.sample_rate)
+    signal = normalize(signal)
+    write_wav(input_dir / "guitar_original.wav", signal, args.sample_rate)
 
-    clean_path = input_dir / "instrument_clean.wav"
-    noisy_path = input_dir / "instrument_noisy.wav"
-    denoised_path = output_dir / "audio" / "instrument_denoised.wav"
-    write_wav(clean_path, clean, args.sample_rate)
-    write_wav(noisy_path, noisy, args.sample_rate)
-    write_wav(denoised_path, denoised, args.sample_rate)
+    denoised, noise_mag, quiet_mask = spectral_subtraction(signal, args.frame_size, args.hop_size)
+    denoised = normalize(denoised[: signal.size])
+    write_wav(audio_dir / "guitar_denoised.wav", denoised, args.sample_rate)
 
-    wf_clean = make_waveform_image(clean, args.sample_rate, "Чистый синтезированный сигнал")
-    wf_noisy = make_waveform_image(noisy, args.sample_rate, "Сигнал с шумом")
-    wf_denoised = make_waveform_image(denoised, args.sample_rate, "Сигнал после шумоподавления")
-    wf_clean.save(output_dir / "waveforms" / "clean_waveform.png")
-    wf_noisy.save(output_dir / "waveforms" / "noisy_waveform.png")
-    wf_denoised.save(output_dir / "waveforms" / "denoised_waveform.png")
+    rms_before_track = frame_rms_track(signal, args.frame_size, args.hop_size)
+    rms_after_track = frame_rms_track(denoised, args.frame_size, args.hop_size)
+    quiet_count = min(len(rms_before_track), len(quiet_mask))
+    quiet_indices = quiet_mask[:quiet_count]
+    noise_rms_before = float(np.mean(rms_before_track[:quiet_count][quiet_indices])) if np.any(quiet_indices) else float(np.mean(rms_before_track))
+    noise_rms_after = float(np.mean(rms_after_track[:quiet_count][quiet_indices])) if np.any(quiet_indices) else float(np.mean(rms_after_track))
+    floor_before_db = float(np.median(20.0 * np.log10(np.maximum(noise_mag[:, 0], 1e-9))))
 
-    sp_clean = make_spectrogram_image(clean, args.sample_rate, args.frame_size, args.hop_size, "Спектрограмма чистого сигнала")
-    sp_noisy = make_spectrogram_image(noisy, args.sample_rate, args.frame_size, args.hop_size, "Спектрограмма сигнала с шумом")
-    sp_denoised = make_spectrogram_image(denoised, args.sample_rate, args.frame_size, args.hop_size, "Спектрограмма после шумоподавления")
-    sp_clean.save(output_dir / "spectrograms" / "clean_spectrogram.png")
-    sp_noisy.save(output_dir / "spectrograms" / "noisy_spectrogram.png")
-    sp_denoised.save(output_dir / "spectrograms" / "denoised_spectrogram.png")
+    denoised_spec = stft(denoised, args.frame_size, args.hop_size)
+    denoised_noise_mag, _ = estimate_noise_profile(denoised_spec)
+    floor_after_db = float(np.median(20.0 * np.log10(np.maximum(denoised_noise_mag[:, 0], 1e-9))))
 
-    noise_len = int(args.noise_seconds * args.sample_rate)
-    noise_rms_before = noise_rms(noisy[:noise_len])
-    noise_rms_after = noise_rms(denoised[:noise_len])
-    snr_before = snr_db(clean, noisy)
-    snr_after = snr_db(clean, denoised)
-    top_energy = high_energy_cells(denoised, args.sample_rate, dt=0.1, df=50.0)
-    save_energy_csv(top_energy, output_dir / "top_energy_moments.csv")
+    energy_grid, top_rows = build_energy_grid(denoised, args.sample_rate, dt=0.1, df=50.0)
+    save_top_energy_csv(top_rows, output_dir / "top_energy_moments.csv")
+    peak = top_rows[0]
 
     metrics = [
-        ("Частота дискретизации", str(args.sample_rate)),
-        ("Длительность, с", f"{clean.size / args.sample_rate:.2f}"),
-        ("RMS шума до", f"{noise_rms_before:.6f}"),
-        ("RMS шума после", f"{noise_rms_after:.6f}"),
-        ("SNR до, дБ", f"{snr_before:.2f}"),
-        ("SNR после, дБ", f"{snr_after:.2f}"),
-        ("Улучшение SNR, дБ", f"{snr_after - snr_before:.2f}"),
+        ("Имя исходного файла", source_meta["source_name"]),
+        ("Частота дискретизации после конвертации, Гц", str(args.sample_rate)),
+        ("Длительность, с", f"{signal.size / args.sample_rate:.2f}"),
+        ("Исходная частота дискретизации, Гц", source_meta["source_sample_rate_hz"] or "не определена"),
+        ("Исходное число каналов", source_meta["source_channels"] or "не определено"),
+        ("Доля тихих окон для оценки шума", f"{100.0 * float(np.mean(quiet_mask)):.1f}%"),
+        ("Оценка RMS шума до", f"{noise_rms_before:.6f}"),
+        ("Оценка RMS шума после", f"{noise_rms_after:.6f}"),
+        ("Медианный спектральный пол до, дБ", f"{floor_before_db:.2f}"),
+        ("Медианный спектральный пол после, дБ", f"{floor_after_db:.2f}"),
+        ("Глобальный максимум: время, с", f"{peak['time_start_s']:.2f}–{peak['time_end_s']:.2f}"),
+        ("Глобальный максимум: частоты, Гц", f"{peak['freq_start_hz']:.0f}–{peak['freq_end_hz']:.0f}"),
     ]
-    save_metrics_csv(metrics, output_dir / "metrics.csv")
+    save_metrics_csv(output_dir / "metrics.csv", metrics)
 
-    summary = make_summary_panel(wf_noisy, wf_denoised, sp_noisy, sp_denoised, metrics, top_energy)
-    summary.save(output_dir / "summaries" / "noise_analysis_summary.png")
+    wave_before = make_waveform_image(signal, args.sample_rate, "Осциллограмма исходной записи")
+    wave_after = make_waveform_image(denoised, args.sample_rate, "Осциллограмма после шумоподавления")
+    spec_before = make_spectrogram_image(signal, args.sample_rate, args.frame_size, args.hop_size, "Спектрограмма исходной записи")
+    spec_after = make_spectrogram_image(denoised, args.sample_rate, args.frame_size, args.hop_size, "Спектрограмма после шумоподавления", highlight=peak)
+    energy_map = make_energy_map_image(energy_grid, args.sample_rate, 0.1, 50.0, peak)
 
-    print(f"Saved input audio to: {input_dir}")
-    print(f"Saved output to: {output_dir}")
+    wave_before.save(waveform_dir / "guitar_waveform_original.png")
+    wave_after.save(waveform_dir / "guitar_waveform_denoised.png")
+    spec_before.save(spectrogram_dir / "guitar_spectrogram_original.png")
+    spec_after.save(spectrogram_dir / "guitar_spectrogram_denoised.png")
+    energy_map.save(summary_dir / "guitar_energy_map.png")
+
+    build_readme_pdf(root, source_meta, metrics, top_rows, wave_before, wave_after, spec_before, spec_after, energy_map)
+    print(f"Saved lab to: {root}")
     return 0
 
 

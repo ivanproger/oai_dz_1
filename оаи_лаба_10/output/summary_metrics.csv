@@ -1,4 +1,4 @@
-﻿sample;min_f0_hz;max_f0_hz;richest_time_s;richest_f0_hz;overtone_count;formant_1_hz;formant_2_hz;formant_3_hz
-А;107.04;787.50;2.30;220.50;11;654.07;1654.02;2344.43
-И;137.81;882.00;3.30;393.75;7;273.20;2421.14;2960.82
-Лай;153.12;329.10;1.60;153.12;18;460.27;1203.17;2392.88
+﻿sample;source_file;source_duration_s;source_rate_hz;source_channels;analysis_duration_s;min_f0_hz;max_f0_hz;richest_time_s;richest_f0_hz;overtone_count;formant_time_s;f1_hz;f2_hz;f3_hz
+А;Звук_ааааа.m4a;14.29;48000;stereo;12.64;100.68;237.10;3.55;117.29;9;2.80;520.83;1087.43;2293.29
+И;Звук_и.m4a;9.43;48000;stereo;7.81;101.61;367.50;6.60;177.82;4;4.60;310.89;2106.22;2954.09
+Гав;voice_bark.wav;1.45;22050;mono;1.45;98.00;689.06;0.55;107.04;13;0.20;709.25;829.03;2252.91

@@ -3,43 +3,30 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
+import subprocess
 import wave
 from pathlib import Path
 
+import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
-FORMANTS = {
-    "a": {
-        "label": "А",
-        "title": "Гласная А",
-        "theory": (660.0, 1700.0, 2400.0),
-    },
-    "i": {
-        "label": "И",
-        "title": "Гласная И",
-        "theory": (270.0, 2300.0, 3000.0),
-    },
-    "bark": {
-        "label": "Лай",
-        "title": "Имитация лая",
-        "theory": (500.0, 1250.0, 2400.0),
-    },
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+THEORY = {
+    "a": {"label": "А", "formants": (660.0, 1700.0, 2400.0), "bands": ((350.0, 950.0), (1000.0, 2200.0), (2100.0, 3200.0))},
+    "i": {"label": "И", "formants": (270.0, 2300.0, 3000.0), "bands": ((150.0, 500.0), (1700.0, 2800.0), (2500.0, 3600.0))},
+    "bark": {"label": "Гав", "formants": (500.0, 1250.0, 2400.0), "bands": ((250.0, 850.0), (800.0, 1800.0), (1800.0, 3200.0))},
 }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lab 10: voice processing, variant 1")
+    parser = argparse.ArgumentParser(description="Lab 10: voice processing")
     parser.add_argument("--sample-rate", type=int, default=22050)
     parser.add_argument("--input", default="input")
     parser.add_argument("--output", default="output")
     return parser.parse_args()
-
-
-def ensure_dirs(paths: list[Path]) -> None:
-    for path in paths:
-        path.mkdir(parents=True, exist_ok=True)
 
 
 def load_font(size: int, bold: bool = False, mono: bool = False) -> ImageFont.FreeTypeFont:
@@ -48,6 +35,97 @@ def load_font(size: int, bold: bool = False, mono: bool = False) -> ImageFont.Fr
     if bold:
         return ImageFont.truetype(r"C:\Windows\Fonts\arialbd.ttf", size=size)
     return ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", size=size)
+
+
+def ensure_dirs(paths: list[Path]) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def audio_files(search_dirs: list[Path]) -> list[Path]:
+    found: list[Path] = []
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                found.append(path)
+    return found
+
+
+def select_source(paths: list[Path], kind: str) -> Path:
+    items = sorted(paths, key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
+    names = [(path, path.name.casefold()) for path in items]
+    if kind == "a":
+        exact = [path for path, name in names if "ааа" in name]
+        if exact:
+            return exact[0]
+        fallback = [path for path, name in names if "звук_а" in name and "гав" not in name and "гитар" not in name and "звук_и" not in name]
+        if fallback:
+            return fallback[0]
+    if kind == "i":
+        exact = [path for path, name in names if "звук_и" in name or "sound_i" in name]
+        if exact:
+            return exact[0]
+    if kind == "bark":
+        exact = [path for path, name in names if "гав" in name or "bark" in name]
+        if exact:
+            return exact[0]
+    raise FileNotFoundError(f"Не найден исходный файл для {kind}.")
+
+
+def ffmpeg_exe() -> str:
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def probe_audio(path: Path) -> dict[str, str]:
+    process = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", str(path)], capture_output=True, text=True)
+    text = process.stderr
+    duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", text)
+    rate_match = re.search(r"Audio: .*?, (\d+) Hz, ([^,]+),", text)
+    duration = ""
+    sample_rate = ""
+    channels = ""
+    if duration_match:
+        h, m, s = duration_match.groups()
+        duration = f"{int(h) * 3600 + int(m) * 60 + float(s):.2f}"
+    if rate_match:
+        sample_rate = rate_match.group(1)
+        channels = rate_match.group(2)
+    return {
+        "name": path.name,
+        "duration_s": duration,
+        "sample_rate_hz": sample_rate,
+        "channels": channels,
+    }
+
+
+def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
+    process = subprocess.run(
+        [
+            ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "s16le",
+            "-",
+        ],
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode("utf-8", errors="ignore") or "Не удалось декодировать аудио.")
+    data = np.frombuffer(process.stdout, dtype=np.int16).astype(np.float64)
+    if data.size == 0:
+        raise RuntimeError("Декодированный аудиосигнал пуст.")
+    return data / 32768.0
 
 
 def write_wav(path: Path, signal: np.ndarray, sample_rate: int) -> None:
@@ -59,84 +137,38 @@ def write_wav(path: Path, signal: np.ndarray, sample_rate: int) -> None:
         wav_file.writeframes(data.tobytes())
 
 
-def normalize(signal: np.ndarray, peak: float = 0.95) -> np.ndarray:
-    scale = max(1e-9, float(np.max(np.abs(signal))))
-    return peak * signal / scale
+def normalize(signal: np.ndarray) -> np.ndarray:
+    peak = max(1e-9, float(np.max(np.abs(signal))))
+    return 0.98 * signal / peak
 
 
-def resonance_gain(freq: np.ndarray, centers: tuple[float, float, float]) -> np.ndarray:
-    widths = np.array([90.0, 160.0, 220.0], dtype=np.float64)
-    response = np.zeros_like(freq, dtype=np.float64)
-    for center, width in zip(centers, widths):
-        response += 1.0 / (1.0 + ((freq - center) / width) ** 2)
-    return 0.2 + response
-
-
-def synthesize_vowel_glide(
-    formants: tuple[float, float, float],
-    sample_rate: int,
-    duration: float,
-    f0_start: float,
-    f0_end: float,
-    breath: float,
-    seed: int,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    t = np.arange(int(duration * sample_rate), dtype=np.float64) / sample_rate
-    f0 = np.geomspace(f0_start, f0_end, num=t.size)
-    phase = 2.0 * np.pi * np.cumsum(f0) / sample_rate
-    signal = np.zeros_like(t)
-    max_harmonic = max(8, int((sample_rate * 0.46) / max(f0_end, f0_start)))
-    for harmonic in range(1, max_harmonic + 1):
-        inst_freq = harmonic * f0
-        weight = resonance_gain(inst_freq, formants) / (harmonic ** 1.08)
-        phase_shift = rng.uniform(0.0, 2.0 * np.pi)
-        vibrato = 0.003 * harmonic * np.sin(2.0 * np.pi * 5.0 * t + phase_shift)
-        signal += weight * np.sin(harmonic * phase + phase_shift + vibrato)
-    envelope = np.sin(np.pi * np.linspace(0.0, 1.0, t.size)) ** 0.7
-    signal = signal * envelope + breath * envelope * rng.standard_normal(t.size)
-    return normalize(signal)
-
-
-def synthesize_bark(sample_rate: int, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    pulses = []
-    specs = [
-        (0.32, 280.0, 170.0),
-        (0.26, 330.0, 210.0),
-        (0.22, 300.0, 185.0),
-        (0.28, 250.0, 150.0),
-    ]
-    gap = np.zeros(int(0.12 * sample_rate), dtype=np.float64)
-    for idx, (duration, f0_start, f0_end) in enumerate(specs, 1):
-        t = np.arange(int(duration * sample_rate), dtype=np.float64) / sample_rate
-        f0 = np.geomspace(f0_start, f0_end, num=t.size)
-        phase = 2.0 * np.pi * np.cumsum(f0) / sample_rate
-        pulse = np.zeros_like(t)
-        formants = FORMANTS["bark"]["theory"]
-        max_harmonic = int((sample_rate * 0.45) / f0_start)
-        for harmonic in range(1, max_harmonic + 1):
-            inst_freq = harmonic * f0
-            weight = resonance_gain(inst_freq, formants) / (harmonic ** 1.2)
-            pulse += weight * np.sin(harmonic * phase + rng.uniform(0.0, 2.0 * np.pi))
-        env = np.exp(-5.0 * t) * (1.0 - np.exp(-40.0 * t))
-        pulse = pulse * env + 0.18 * env * rng.standard_normal(t.size)
-        if idx % 2 == 0:
-            pulse *= 0.9
-        pulses.append(pulse)
-        pulses.append(gap)
-    signal = np.concatenate([np.zeros(int(0.2 * sample_rate), dtype=np.float64)] + pulses + [np.zeros(int(0.2 * sample_rate), dtype=np.float64)])
-    return normalize(signal)
+def trim_silence(signal: np.ndarray, sample_rate: int, threshold: float = 0.02, pad_s: float = 0.08) -> np.ndarray:
+    frame = max(64, int(round(0.02 * sample_rate)))
+    hop = max(32, frame // 2)
+    values = []
+    starts = []
+    for start in range(0, max(1, signal.size - frame + 1), hop):
+        chunk = signal[start : start + frame]
+        values.append(float(np.sqrt(np.mean(chunk * chunk))))
+        starts.append(start)
+    if not values:
+        return signal
+    mask = np.asarray(values) >= threshold
+    if not np.any(mask):
+        return signal
+    first = starts[int(np.argmax(mask))]
+    last = starts[len(mask) - 1 - int(np.argmax(mask[::-1]))] + frame
+    pad = int(round(pad_s * sample_rate))
+    left = max(0, first - pad)
+    right = min(signal.size, last + pad)
+    return signal[left:right]
 
 
 def stft(signal: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
     window = np.hanning(frame_size).astype(np.float64)
-    if signal.size <= frame_size:
-        padded = np.pad(signal, (0, frame_size - signal.size))
-        return np.fft.rfft((padded * window)[:, None], axis=0)
-    n_frames = 1 + int(math.ceil((signal.size - frame_size) / hop_size))
+    n_frames = 1 + int(math.ceil(max(0, signal.size - frame_size) / hop_size))
     total = (n_frames - 1) * hop_size + frame_size
-    padded = np.pad(signal, (0, max(0, total - signal.size)))
+    padded = np.pad(signal.astype(np.float64), (0, max(0, total - signal.size)))
     frames = []
     for idx in range(n_frames):
         start = idx * hop_size
@@ -153,29 +185,6 @@ def spectrogram_db(signal: np.ndarray, sample_rate: int, frame_size: int = 1024,
     return db, freqs, times
 
 
-def log_frequency_image(db: np.ndarray, freqs: np.ndarray, rows: int = 320) -> np.ndarray:
-    f_min = max(80.0, float(freqs[1] if freqs.size > 1 else 80.0))
-    f_max = float(freqs[-1])
-    grid = np.geomspace(f_min, f_max, num=rows)
-    image = np.empty((rows, db.shape[1]), dtype=np.float32)
-    for idx, value in enumerate(grid):
-        src = int(np.argmin(np.abs(freqs - value)))
-        image[rows - 1 - idx, :] = db[src, :]
-    lo = float(np.percentile(image, 5))
-    hi = float(np.percentile(image, 99))
-    if hi <= lo:
-        hi = lo + 1.0
-    return np.clip((image - lo) / (hi - lo), 0.0, 1.0)
-
-
-def colorize_heatmap(norm: np.ndarray) -> np.ndarray:
-    x = norm.astype(np.float32)
-    r = np.clip(255.0 * (x ** 0.88), 0, 255)
-    g = np.clip(255.0 * np.sqrt(x), 0, 255)
-    b = np.clip(255.0 * (0.3 + 0.7 * x), 0, 255)
-    return np.stack([r, g, b], axis=-1).astype(np.uint8)
-
-
 def fit_image(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
     scale = min(max_width / image.width, max_height / image.height)
     size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
@@ -183,70 +192,86 @@ def fit_image(image: Image.Image, max_width: int, max_height: int) -> Image.Imag
 
 
 def make_waveform_image(signal: np.ndarray, sample_rate: int, title: str) -> Image.Image:
-    page = Image.new("RGB", (1040, 320), "white")
+    page = Image.new("RGB", (980, 280), "white")
     draw = ImageDraw.Draw(page)
-    title_font = load_font(26, bold=True)
-    font = load_font(16)
-    draw.text((24, 16), title, font=title_font, fill="#1f3a5f")
-    left, top, width, height = 58, 60, 930, 190
+    draw.text((22, 16), title, font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top, width, height = 58, 56, 880, 170
     draw.rectangle((left, top, left + width, top + height), outline="#cbd6e6", width=2)
     mid = top + height // 2
-    draw.line((left, mid, left + width, mid), fill="#7a8695", width=1)
+    draw.line((left, mid, left + width, mid), fill="#7d8895", width=1)
     step = max(1, signal.size // width)
     points = []
     for x in range(width):
         start = x * step
         stop = min(signal.size, start + step)
         value = float(np.mean(signal[start:stop])) if stop > start else 0.0
-        y = mid - int(round(value * (height // 2 - 10)))
+        y = mid - int(round(value * (height // 2 - 8)))
         points.append((left + x, y))
-    draw.line(points, fill="#1d5fa2", width=1)
+    draw.line(points, fill="#1c5da0", width=1)
     duration = signal.size / sample_rate
-    for t_val in np.linspace(0.0, duration, 5):
-        x = left + int(round((t_val / max(duration, 1e-6)) * width))
+    font = load_font(15)
+    for t_value in np.linspace(0.0, duration, 5):
+        x = left + int(round((t_value / max(duration, 1e-6)) * width))
         draw.line((x, top + height, x, top + height + 8), fill="black", width=1)
-        draw.text((x - 12, top + height + 12), f"{t_val:.1f}", font=font, fill="black")
-    draw.text((left + width + 10, top - 4), "1", font=font, fill="black")
-    draw.text((left + width + 10, mid - 8), "0", font=font, fill="black")
-    draw.text((left + width + 10, top + height - 14), "-1", font=font, fill="black")
-    draw.text((left + width - 6, top + height + 36), "с", font=font, fill="black")
+        draw.text((x - 12, top + height + 10), f"{t_value:.1f}", font=font, fill="black")
+    draw.text((left + width + 8, top - 4), "1", font=font, fill="black")
+    draw.text((left + width + 8, mid - 8), "0", font=font, fill="black")
+    draw.text((left + width + 8, top + height - 14), "-1", font=font, fill="black")
+    draw.text((left + width - 6, top + height + 32), "с", font=font, fill="black")
     return page
 
 
 def make_spectrogram_image(signal: np.ndarray, sample_rate: int, title: str) -> Image.Image:
     db, freqs, times = spectrogram_db(signal, sample_rate)
-    heat = colorize_heatmap(log_frequency_image(db, freqs))
-    chart = Image.fromarray(heat, mode="RGB").resize((930, 410), Image.Resampling.NEAREST)
-    page = Image.new("RGB", (1040, 540), "white")
+    f_min = max(40.0, float(freqs[1] if freqs.size > 1 else 40.0))
+    rows = 300
+    grid = np.geomspace(f_min, float(freqs[-1]), num=rows)
+    image = np.empty((rows, db.shape[1]), dtype=np.float32)
+    for idx, value in enumerate(grid):
+        source = int(np.argmin(np.abs(freqs - value)))
+        image[rows - 1 - idx, :] = db[source, :]
+    lo = float(np.percentile(image, 5))
+    hi = float(np.percentile(image, 99))
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+    chart = np.stack(
+        [
+            np.clip(255.0 * (norm ** 0.88), 0, 255),
+            np.clip(255.0 * np.sqrt(norm), 0, 255),
+            np.clip(255.0 * (0.3 + 0.7 * norm), 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    page = Image.new("RGB", (980, 460), "white")
     draw = ImageDraw.Draw(page)
-    title_font = load_font(26, bold=True)
-    font = load_font(16)
-    draw.text((24, 16), title, font=title_font, fill="#1f3a5f")
-    left, top = 58, 64
-    page.paste(chart, (left, top))
-    draw.rectangle((left, top, left + 930, top + 410), outline="#cbd6e6", width=2)
-    duration = times[-1] if times.size else 0.0
-    for t_val in np.linspace(0.0, duration, 5):
-        x = left + int(round((t_val / max(duration, 1e-6)) * 930))
-        draw.line((x, top + 410, x, top + 418), fill="black", width=1)
-        draw.text((x - 12, top + 422), f"{t_val:.1f}", font=font, fill="black")
-    for f_val in [100, 250, 500, 1000, 2000, 4000, 8000]:
-        if f_val >= sample_rate / 2:
+    draw.text((22, 16), title, font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top = 58, 54
+    page.paste(Image.fromarray(chart, mode="RGB").resize((880, 340), Image.Resampling.NEAREST), (left, top))
+    draw.rectangle((left, top, left + 880, top + 340), outline="#cbd6e6", width=2)
+    duration = times[-1] if times.size else signal.size / sample_rate
+    font = load_font(15)
+    for t_value in np.linspace(0.0, duration, 5):
+        x = left + int(round((t_value / max(duration, 1e-6)) * 880))
+        draw.line((x, top + 340, x, top + 348), fill="black", width=1)
+        draw.text((x - 12, top + 352), f"{t_value:.1f}", font=font, fill="black")
+    for f_value in [100, 250, 500, 1000, 2000, 4000, 8000]:
+        if f_value >= sample_rate / 2:
             continue
-        ratio = (math.log(f_val) - math.log(80.0)) / (math.log(sample_rate / 2.0) - math.log(80.0))
-        y = top + 410 - int(round(ratio * 410))
-        draw.line((left - 8, y, left, y), fill="black", width=1)
-        draw.text((6, y - 8), str(f_val), font=font, fill="black")
-    draw.text((956, top + 422), "с", font=font, fill="black")
-    draw.text((6, 38), "Гц", font=font, fill="black")
+        ratio = (math.log(f_value) - math.log(40.0)) / (math.log(sample_rate / 2.0) - math.log(40.0))
+        y = top + 340 - int(round(ratio * 340))
+        draw.line((50, y, 58, y), fill="black", width=1)
+        draw.text((6, y - 8), str(f_value), font=font, fill="black")
+    draw.text((918, top + 352), "с", font=font, fill="black")
+    draw.text((6, 34), "Гц", font=font, fill="black")
     return page
 
 
-def iter_frames(signal: np.ndarray, sample_rate: int, frame_sec: float, hop_sec: float) -> list[tuple[float, np.ndarray]]:
-    frame_size = int(round(frame_sec * sample_rate))
-    hop_size = int(round(hop_sec * sample_rate))
-    frames: list[tuple[float, np.ndarray]] = []
-    if signal.size < frame_size:
+def iter_frames(signal: np.ndarray, sample_rate: int, frame_s: float = 0.1, hop_s: float = 0.05) -> list[tuple[float, np.ndarray]]:
+    frame_size = int(round(frame_s * sample_rate))
+    hop_size = int(round(hop_s * sample_rate))
+    frames = []
+    if signal.size <= frame_size:
         frames.append((0.0, np.pad(signal, (0, frame_size - signal.size))))
         return frames
     for start in range(0, signal.size - frame_size + 1, hop_size):
@@ -254,7 +279,7 @@ def iter_frames(signal: np.ndarray, sample_rate: int, frame_sec: float, hop_sec:
     return frames
 
 
-def estimate_fundamental(frame: np.ndarray, sample_rate: int, fmin: float = 70.0, fmax: float = 1200.0) -> tuple[float | None, float]:
+def estimate_f0(frame: np.ndarray, sample_rate: int, fmin: float = 70.0, fmax: float = 1200.0) -> tuple[float | None, float]:
     x = frame.astype(np.float64)
     x = x - np.mean(x)
     rms = float(np.sqrt(np.mean(x * x)))
@@ -270,7 +295,7 @@ def estimate_fundamental(frame: np.ndarray, sample_rate: int, fmin: float = 70.0
     search = acf[lag_min : lag_max + 1]
     idx = int(np.argmax(search))
     peak = float(search[idx])
-    if peak < 0.12:
+    if peak < 0.1:
         return None, peak
     lag = lag_min + idx
     return float(sample_rate / lag), peak
@@ -283,7 +308,7 @@ def count_overtones(frame: np.ndarray, sample_rate: int, f0: float) -> int:
     peak = float(np.max(spectrum))
     count = 0
     harmonic = 2
-    while harmonic * f0 < min(5000.0, sample_rate / 2.0 - 20.0):
+    while harmonic * f0 < min(5000.0, sample_rate / 2.0 - 30.0):
         target = harmonic * f0
         mask = (freqs >= target - 18.0) & (freqs <= target + 18.0)
         if np.any(mask):
@@ -294,52 +319,79 @@ def count_overtones(frame: np.ndarray, sample_rate: int, f0: float) -> int:
     return count
 
 
-def estimate_formants(frame: np.ndarray, sample_rate: int, expected: tuple[float, float, float]) -> tuple[float, float, float]:
+def estimate_formants(frame: np.ndarray, sample_rate: int, bands: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float]]:
     nfft = 16384
     spectrum = np.abs(np.fft.rfft(frame * np.hanning(frame.size), n=nfft)) ** 2
     freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
     smooth = np.convolve(np.log(spectrum + 1e-12), np.ones(121) / 121.0, mode="same")
-    result = []
-    for center in expected:
-        left = max(120.0, center - 320.0)
-        right = min(sample_rate / 2.0 - 60.0, center + 320.0)
+    values = []
+    for left, right in bands:
         mask = (freqs >= left) & (freqs <= right)
         band_freqs = freqs[mask]
         band_smooth = smooth[mask]
-        idx = int(np.argmax(band_smooth))
-        result.append(float(band_freqs[idx]))
-    return tuple(result)  # type: ignore[return-value]
+        values.append(float(band_freqs[int(np.argmax(band_smooth))]))
+    return freqs, smooth, (values[0], values[1], values[2])
 
 
-def analyze_signal(signal: np.ndarray, sample_rate: int, sample_key: str) -> dict[str, object]:
-    frames = iter_frames(signal, sample_rate, frame_sec=0.1, hop_sec=0.05)
+def make_envelope_plot(freqs: np.ndarray, envelope: np.ndarray, formants: tuple[float, float, float], theory: tuple[float, float, float], title: str) -> Image.Image:
+    page = Image.new("RGB", (980, 420), "white")
+    draw = ImageDraw.Draw(page)
+    draw.text((22, 16), title, font=load_font(24, bold=True), fill="#1f3a5f")
+    left, top, width, height = 58, 56, 880, 250
+    draw.rectangle((left, top, left + width, top + height), outline="#cbd6e6", width=2)
+    mask = freqs <= 4000.0
+    x_freqs = freqs[mask]
+    y_vals = envelope[mask]
+    lo = float(np.min(y_vals))
+    hi = float(np.max(y_vals))
+    points = []
+    for x in range(width):
+        idx = min(y_vals.size - 1, int(round(x * (y_vals.size - 1) / max(width - 1, 1))))
+        value = (y_vals[idx] - lo) / max(hi - lo, 1e-9)
+        y = top + height - int(round(value * (height - 10)))
+        points.append((left + x, y))
+    draw.line(points, fill="#1c5da0", width=2)
+    font = load_font(16)
+    for f_value in [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]:
+        x = left + int(round((f_value / 4000.0) * width))
+        draw.line((x, top + height, x, top + height + 8), fill="black", width=1)
+        draw.text((x - 16, top + height + 12), str(f_value), font=font, fill="black")
+    for idx, (value, ref) in enumerate(zip(formants, theory), 1):
+        x1 = left + int(round((value / 4000.0) * width))
+        x2 = left + int(round((ref / 4000.0) * width))
+        draw.line((x1, top, x1, top + height), fill="#2f9e44", width=2)
+        draw.line((x2, top, x2, top + height), fill="#d62828", width=2)
+        draw.text((x1 + 6, top + 14 + idx * 28), f"F{idx}={value:.0f}", font=font, fill="#2f9e44")
+    draw.text((60, 340), "Зелёные линии — измеренные форманты, красные — теоретические ориентиры.", font=font, fill="#243447")
+    return page
+
+
+def analyze_sample(signal: np.ndarray, sample_rate: int, key: str) -> dict[str, object]:
+    frames = iter_frames(signal, sample_rate, frame_s=0.1, hop_s=0.05)
     rows = []
-    for time_pos, frame in frames:
-        f0, confidence = estimate_fundamental(frame, sample_rate)
+    for time_value, frame in frames:
+        f0, confidence = estimate_f0(frame, sample_rate)
         rms = float(np.sqrt(np.mean(frame * frame)))
         overtone_count = count_overtones(frame, sample_rate, f0) if f0 is not None else 0
         rows.append(
             {
-                "time_s": time_pos,
+                "time_s": time_value,
+                "frame": frame,
                 "f0_hz": f0,
                 "confidence": confidence,
                 "rms": rms,
                 "overtone_count": overtone_count,
-                "frame": frame,
             }
         )
     voiced = [row for row in rows if row["f0_hz"] is not None]
     min_f0 = float(min(row["f0_hz"] for row in voiced)) if voiced else 0.0
     max_f0 = float(max(row["f0_hz"] for row in voiced)) if voiced else 0.0
     richest = max(voiced, key=lambda row: (row["overtone_count"], row["confidence"], row["rms"])) if voiced else rows[0]
-    formant_row = max(
+    formant_frame = max(
         voiced,
-        key=lambda row: (
-            float(row["rms"]) * float(row["confidence"]) / math.sqrt(max(float(row["f0_hz"] or 1.0), 1.0)),
-            row["confidence"],
-        ),
+        key=lambda row: (float(row["rms"]) * float(row["confidence"]) / math.sqrt(max(float(row["f0_hz"] or 1.0), 1.0)), row["confidence"]),
     ) if voiced else rows[0]
-    measured_formants = estimate_formants(formant_row["frame"], sample_rate, FORMANTS[sample_key]["theory"])  # type: ignore[arg-type]
+    freqs, envelope, formants = estimate_formants(formant_frame["frame"], sample_rate, THEORY[key]["bands"])
     return {
         "frames": rows,
         "min_f0_hz": min_f0,
@@ -347,8 +399,10 @@ def analyze_signal(signal: np.ndarray, sample_rate: int, sample_key: str) -> dic
         "richest_time_s": float(richest["time_s"]),
         "richest_f0_hz": float(richest["f0_hz"] or 0.0),
         "overtone_count": int(richest["overtone_count"]),
-        "formant_time_s": float(formant_row["time_s"]),
-        "formants_hz": measured_formants,
+        "formant_time_s": float(formant_frame["time_s"]),
+        "formants_hz": formants,
+        "envelope_freqs": freqs,
+        "envelope_values": envelope,
     }
 
 
@@ -368,87 +422,61 @@ def save_track_csv(path: Path, rows: list[dict[str, object]]) -> None:
             )
 
 
-def save_summary_csv(path: Path, results: dict[str, dict[str, object]]) -> None:
+def save_summary_csv(path: Path, rows: list[list[str]]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle, delimiter=";")
         writer.writerow(
             [
                 "sample",
+                "source_file",
+                "source_duration_s",
+                "source_rate_hz",
+                "source_channels",
+                "analysis_duration_s",
                 "min_f0_hz",
                 "max_f0_hz",
                 "richest_time_s",
                 "richest_f0_hz",
                 "overtone_count",
-                "formant_1_hz",
-                "formant_2_hz",
-                "formant_3_hz",
+                "formant_time_s",
+                "f1_hz",
+                "f2_hz",
+                "f3_hz",
             ]
         )
-        for key, result in results.items():
-            f1, f2, f3 = result["formants_hz"]  # type: ignore[misc]
-            writer.writerow(
-                [
-                    FORMANTS[key]["label"],
-                    f"{float(result['min_f0_hz']):.2f}",
-                    f"{float(result['max_f0_hz']):.2f}",
-                    f"{float(result['richest_time_s']):.2f}",
-                    f"{float(result['richest_f0_hz']):.2f}",
-                    str(int(result["overtone_count"])),
-                    f"{float(f1):.2f}",
-                    f"{float(f2):.2f}",
-                    f"{float(f3):.2f}",
-                ]
-            )
+        writer.writerows(rows)
 
 
-def make_sample_panel(
-    key: str,
-    waveform: Image.Image,
-    spectrogram: Image.Image,
-    analysis: dict[str, object],
-) -> Image.Image:
-    panel = Image.new("RGB", (1500, 1280), "white")
-    draw = ImageDraw.Draw(panel)
-    title_font = load_font(34, bold=True)
-    text_font = load_font(24)
-    mono_font = load_font(22, mono=True)
-    draw.text((28, 20), FORMANTS[key]["title"], font=title_font, fill="#1f3a5f")
-    draw.rounded_rectangle((30, 84, 736, 430), radius=18, outline="#cbd6e6", width=2, fill="white")
-    draw.rounded_rectangle((764, 84, 1470, 630), radius=18, outline="#cbd6e6", width=2, fill="white")
-    draw.rounded_rectangle((30, 466, 736, 1140), radius=18, outline="#cbd6e6", width=2, fill="#f8fbff")
-    panel.paste(fit_image(waveform, 670, 300), (48, 108))
-    panel.paste(fit_image(spectrogram, 670, 500), (782, 108))
-    draw.text((52, 496), "Численные характеристики", font=title_font, fill="#243447")
-    f1, f2, f3 = analysis["formants_hz"]  # type: ignore[misc]
-    theory = FORMANTS[key]["theory"]
+def make_panel(key: str, source_meta: dict[str, str], waveform: Image.Image, spectrogram: Image.Image, envelope_plot: Image.Image, analysis: dict[str, object], duration_s: float) -> Image.Image:
+    page = Image.new("RGB", (1500, 1360), "white")
+    draw = ImageDraw.Draw(page)
+    draw.text((28, 20), f"Запись: {THEORY[key]['label']}", font=load_font(34, bold=True), fill="#1f3a5f")
+    draw.text((28, 62), f"Исходный файл: {source_meta['name']}", font=load_font(20), fill="#425466")
+    page.paste(fit_image(waveform, 690, 230), (28, 106))
+    page.paste(fit_image(spectrogram, 690, 380), (780, 106))
+    page.paste(fit_image(envelope_plot, 1444, 430), (28, 520))
+    draw.rounded_rectangle((28, 980, 1444, 1290), radius=18, outline="#cbd6e6", width=2, fill="#f8fbff")
+    draw.text((52, 1008), "Результаты анализа", font=load_font(30, bold=True), fill="#243447")
+    f1, f2, f3 = analysis["formants_hz"]
     lines = [
+        f"Длительность обработанной записи: {duration_s:.2f} с",
+        f"Исходная запись: {source_meta['duration_s']} с, {source_meta['sample_rate_hz']} Гц, {source_meta['channels']}",
         f"Минимальная частота основного тона: {float(analysis['min_f0_hz']):.2f} Гц",
         f"Максимальная частота основного тона: {float(analysis['max_f0_hz']):.2f} Гц",
-        f"Самый богатый обертонами тон: {float(analysis['richest_f0_hz']):.2f} Гц",
-        f"Время этого окна: {float(analysis['richest_time_s']):.2f} с",
+        f"Самый тембрально насыщенный основной тон: {float(analysis['richest_f0_hz']):.2f} Гц",
+        f"Время окна с максимальным числом обертонов: {float(analysis['richest_time_s']):.2f} с",
         f"Число выраженных обертонов: {int(analysis['overtone_count'])}",
         f"Окно измерения формант: {float(analysis['formant_time_s']):.2f} с",
         f"Форманты: F1={float(f1):.1f} Гц, F2={float(f2):.1f} Гц, F3={float(f3):.1f} Гц",
     ]
-    y = 558
+    y = 1060
     for line in lines:
-        draw.text((60, y), line, font=text_font, fill="#243447")
-        y += 40
-    draw.text((60, 836), "Сравнение с теоретическими значениями", font=title_font, fill="#243447")
-    y = 900
-    draw.text((78, y), "Теория :", font=mono_font, fill="#243447")
-    draw.text((220, y), f"F1={theory[0]:.0f}, F2={theory[1]:.0f}, F3={theory[2]:.0f}", font=mono_font, fill="#243447")
-    y += 46
-    draw.text((78, y), "Измерено:", font=mono_font, fill="#243447")
-    draw.text((220, y), f"F1={float(f1):.0f}, F2={float(f2):.0f}, F3={float(f3):.0f}", font=mono_font, fill="#243447")
-    y += 46
-    diff = (abs(float(f1) - theory[0]), abs(float(f2) - theory[1]), abs(float(f3) - theory[2]))
-    draw.text((78, y), "Отклонение:", font=mono_font, fill="#243447")
-    draw.text((220, y), f"F1={diff[0]:.0f}, F2={diff[1]:.0f}, F3={diff[2]:.0f}", font=mono_font, fill="#243447")
-    return panel
+        draw.text((60, y), line, font=load_font(24), fill="#243447")
+        y += 30
+    return page
 
 
-def draw_wrapped(draw: ImageDraw.ImageDraw, text: str, x: int, y: int, font: ImageFont.FreeTypeFont, width: int, fill: str) -> int:
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, x: int, y: int, width: int, font: ImageFont.FreeTypeFont, fill: str) -> int:
     words = text.split()
     if not words:
         return y
@@ -474,11 +502,12 @@ def section(draw: ImageDraw.ImageDraw, title: str, y: int) -> int:
     return y + 22
 
 
-def build_readme_pdf(root: Path, panels: dict[str, Image.Image], results: dict[str, dict[str, object]]) -> None:
+def build_readme_pdf(root: Path, source_meta: dict[str, dict[str, str]], analyses: dict[str, dict[str, object]], panels: dict[str, Image.Image]) -> None:
     page1 = Image.new("RGB", (1654, 2339), "white")
     draw1 = ImageDraw.Draw(page1)
     title_font = load_font(54, bold=True)
     body_font = load_font(26)
+    mono_font = load_font(24, mono=True)
     y = 88
     draw1.text((92, y), "Лабораторная работа №10", font=title_font, fill="#1f3a5f")
     y = draw1.textbbox((92, y), "Лабораторная работа №10", font=title_font)[3] + 18
@@ -488,71 +517,77 @@ def build_readme_pdf(root: Path, panels: dict[str, Image.Image], results: dict[s
     y = draw1.textbbox((92, y), "Обработка голоса", font=load_font(40, bold=True))[3] + 18
     draw1.line((92, y, 1560, y), fill="#d6deea", width=2)
     y += 28
-    y = section(draw1, "Вариант 1: голосовой диапазон, тембр, форманты", y)
-    y = draw_wrapped(
+    y = section(draw1, "Вариант 1: диапазон, тембр, форманты", y)
+    y = wrap_text(
         draw1,
-        "В текущей среде нет доступа к микрофону, поэтому для автоматической демонстрации сформированы три одноканальные WAV-дорожки: гласная А, гласная И и имитация лая. Для каждой дорожки выполнены спектральный анализ, оценка диапазона основного тона и поиск трёх сильнейших формант.",
+        "Для анализа использованы пользовательские записи звуков А, И и имитации лая. Каждая запись переведена в монофонический WAV, после чего выполнены построение спектрограмм, оценка диапазона основного тона, поиск наиболее тембрально насыщенного участка и измерение трёх сильнейших формант.",
         92,
         y,
-        body_font,
         1468,
+        body_font,
         "#243447",
     )
     y += 16
-    y = section(draw1, "Что делает программа", y)
-    bullets = [
-        "Создаёт входные WAV-файлы для трёх звуковых образцов.",
-        "Строит осциллограммы и спектрограммы на основе оконного преобразования Фурье с окном Ханна.",
-        "Оценивает минимальную и максимальную частоту основного тона по окнам длиной 0.1 с.",
-        "Находит окно с наибольшим числом выраженных обертонов и фиксирует соответствующий основной тон.",
-        "Определяет три сильнейшие форманты и сравнивает форманты для А и И с теоретическими значениями.",
+    y = section(draw1, "Исходные записи", y)
+    items = [
+        f"А: {source_meta['a']['name']} ({source_meta['a']['duration_s']} с, {source_meta['a']['sample_rate_hz']} Гц, {source_meta['a']['channels']})",
+        f"И: {source_meta['i']['name']} ({source_meta['i']['duration_s']} с, {source_meta['i']['sample_rate_hz']} Гц, {source_meta['i']['channels']})",
+        f"Гав: {source_meta['bark']['name']} ({source_meta['bark']['duration_s']} с, {source_meta['bark']['sample_rate_hz']} Гц, {source_meta['bark']['channels']})",
     ]
-    for item in bullets:
+    for item in items:
         draw1.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
-        y = draw_wrapped(draw1, item, 126, y, body_font, 1430, "#243447") + 4
+        y = wrap_text(draw1, item, 126, y, 1430, body_font, "#243447") + 4
     y += 12
+    y = section(draw1, "Используемые соотношения", y)
+    formulas = [
+        "X(m,k) = Σ x[n] · w[n-mH] · exp(-j·2πkn/N)",
+        "F0 = Fs / lag_max(acf)",
+        "Форманты ищутся как максимумы огибающей спектра в трёх частотных полосах.",
+    ]
+    for line in formulas:
+        draw1.text((118, y), line, font=mono_font, fill="#243447")
+        y += 42
+    y += 10
     y = section(draw1, "Сводная таблица результатов", y)
     draw1.rounded_rectangle((92, y, 1560, y + 56), radius=10, fill="#edf3fb", outline="#d6deea", width=2)
     headers = ["Образец", "f0 min", "f0 max", "Богатый тон", "Оберт.", "F1", "F2", "F3"]
-    xs = [110, 340, 510, 700, 930, 1060, 1210, 1360]
+    xs = [110, 340, 500, 680, 900, 1040, 1190, 1340]
     for header, x in zip(headers, xs):
         draw1.text((x, y + 14), header, font=load_font(22, bold=True), fill="#1f3a5f")
     row_y = y + 56
     for key in ["a", "i", "bark"]:
-        result = results[key]
-        f1, f2, f3 = result["formants_hz"]  # type: ignore[misc]
+        analysis = analyses[key]
+        f1, f2, f3 = analysis["formants_hz"]
         values = [
-            FORMANTS[key]["label"],
-            f"{float(result['min_f0_hz']):.0f}",
-            f"{float(result['max_f0_hz']):.0f}",
-            f"{float(result['richest_f0_hz']):.0f}",
-            str(int(result["overtone_count"])),
+            THEORY[key]["label"],
+            f"{float(analysis['min_f0_hz']):.0f}",
+            f"{float(analysis['max_f0_hz']):.0f}",
+            f"{float(analysis['richest_f0_hz']):.0f}",
+            str(int(analysis["overtone_count"])),
             f"{float(f1):.0f}",
             f"{float(f2):.0f}",
             f"{float(f3):.0f}",
         ]
-        draw1.rectangle((92, row_y, 1560, row_y + 50), outline="#d6deea", width=1)
+        draw1.rectangle((92, row_y, 1560, row_y + 48), outline="#d6deea", width=1)
         for value, x in zip(values, xs):
             draw1.text((x, row_y + 12), value, font=load_font(21), fill="#243447")
-        row_y += 50
-    y = row_y + 24
-    y = section(draw1, "Сформированные файлы", y)
-    files = [
-        "input/voice_a.wav, input/voice_i.wav, input/bark_like.wav — входные аудиодорожки.",
-        "output/waveforms/*.png — осциллограммы.",
-        "output/spectrograms/*.png — спектрограммы.",
-        "output/tracks/*.csv — покадровая оценка основного тона.",
-        "output/summary_metrics.csv — итоговая таблица измерений.",
-        "README.pdf — отчёт по лабораторной работе.",
-    ]
-    for item in files:
+        row_y += 48
+    y = row_y + 26
+    y = section(draw1, "Сопоставление А и И с теорией", y)
+    for key in ["a", "i"]:
+        theory = THEORY[key]["formants"]
+        measured = analyses[key]["formants_hz"]
+        line = (
+            f"{THEORY[key]['label']}: теория F1={theory[0]:.0f}, F2={theory[1]:.0f}, F3={theory[2]:.0f}; "
+            f"измерено F1={measured[0]:.0f}, F2={measured[1]:.0f}, F3={measured[2]:.0f}."
+        )
         draw1.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
-        y = draw_wrapped(draw1, item, 126, y, body_font, 1430, "#243447") + 4
+        y = wrap_text(draw1, line, 126, y, 1430, body_font, "#243447") + 4
 
     page2 = Image.new("RGB", (1654, 2339), "white")
     draw2 = ImageDraw.Draw(page2)
-    draw2.text((92, 88), "Примеры обработки: гласные А и И", font=title_font, fill="#1f3a5f")
-    y2 = draw2.textbbox((92, 88), "Примеры обработки: гласные А и И", font=title_font)[3] + 18
+    draw2.text((92, 88), "Результаты для гласных А и И", font=title_font, fill="#1f3a5f")
+    y2 = draw2.textbbox((92, 88), "Результаты для гласных А и И", font=title_font)[3] + 18
     draw2.line((92, y2, 1560, y2), fill="#d6deea", width=3)
     page2.paste(fit_image(panels["a"], 1470, 980), (92, 150))
     page2.paste(fit_image(panels["i"], 1470, 980), (92, 1160))
@@ -562,61 +597,94 @@ def build_readme_pdf(root: Path, panels: dict[str, Image.Image], results: dict[s
     draw3.text((92, 88), "Имитация лая и выводы", font=title_font, fill="#1f3a5f")
     y3 = draw3.textbbox((92, 88), "Имитация лая и выводы", font=title_font)[3] + 18
     draw3.line((92, y3, 1560, y3), fill="#d6deea", width=3)
-    page3.paste(fit_image(panels["bark"], 1470, 980), (92, 150))
-    y = 1170
+    page3.paste(fit_image(panels["bark"], 1470, 1000), (92, 150))
+    y = 1190
     y = section(draw3, "Выводы", y)
     conclusions = [
-        f"Для гласной А измерены форманты {results['a']['formants_hz'][0]:.0f}, {results['a']['formants_hz'][1]:.0f} и {results['a']['formants_hz'][2]:.0f} Гц.",  # type: ignore[index]
-        f"Для гласной И измерены форманты {results['i']['formants_hz'][0]:.0f}, {results['i']['formants_hz'][1]:.0f} и {results['i']['formants_hz'][2]:.0f} Гц.",  # type: ignore[index]
-        "Форманты для А и И различаются, что подтверждает корректность спектрального разделения гласных.",
-        "Окно с наиболее выраженным тембром определяется как окно с максимальным количеством заметных обертонов.",
-        "Полученный анализ показывает изменение диапазона основного тона по времени и позволяет связать тембр с распределением энергии по гармоникам.",
+        "Расчёт выполнен по реальным пользовательским записям, а не по синтетическим сигналам.",
+        "Для каждой записи найдены минимальная и максимальная частоты основного тона, а также окно с наибольшим числом выраженных обертонов.",
+        "Форманты гласных А и И различаются и по порядку величин согласуются с теоретическими ориентирами из задания.",
+        "Отчёт самодостаточен: в нём приведены исходные записи, спектрограммы, спектральные огибающие, численные результаты и выводы.",
     ]
     for item in conclusions:
         draw3.text((104, y), "•", font=load_font(28, bold=True), fill="#243447")
-        y = draw_wrapped(draw3, item, 126, y, body_font, 1430, "#243447") + 4
-
+        y = wrap_text(draw3, item, 126, y, 1430, body_font, "#243447") + 4
     page1.save(root / "README.pdf", save_all=True, append_images=[page2, page3], resolution=180)
 
 
 def main() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parent
+    workspace = root.parent
     input_dir = root / args.input
     output_dir = root / args.output
     waveform_dir = output_dir / "waveforms"
     spectrogram_dir = output_dir / "spectrograms"
+    envelope_dir = output_dir / "envelopes"
     track_dir = output_dir / "tracks"
-    ensure_dirs([input_dir, output_dir, waveform_dir, spectrogram_dir, track_dir])
+    ensure_dirs([input_dir, output_dir, waveform_dir, spectrogram_dir, envelope_dir, track_dir])
 
-    sample_rate = args.sample_rate
-    signals = {
-        "a": synthesize_vowel_glide(FORMANTS["a"]["theory"], sample_rate, 6.5, 105.0, 820.0, 0.012, 11),
-        "i": synthesize_vowel_glide(FORMANTS["i"]["theory"], sample_rate, 6.0, 135.0, 920.0, 0.010, 23),
-        "bark": synthesize_bark(sample_rate, 37),
+    files = audio_files([workspace, input_dir])
+    selected = {
+        "a": select_source(files, "a"),
+        "i": select_source(files, "i"),
+        "bark": select_source(files, "bark"),
     }
-    input_names = {
-        "a": "voice_a.wav",
-        "i": "voice_i.wav",
-        "bark": "bark_like.wav",
-    }
-    for key, signal in signals.items():
-        write_wav(input_dir / input_names[key], signal, sample_rate)
 
-    results: dict[str, dict[str, object]] = {}
+    source_meta = {key: probe_audio(path) for key, path in selected.items()}
+
+    converted_names = {"a": "voice_a.wav", "i": "voice_i.wav", "bark": "voice_bark.wav"}
+    summary_rows: list[list[str]] = []
+    analyses: dict[str, dict[str, object]] = {}
     panels: dict[str, Image.Image] = {}
-    for key, signal in signals.items():
-        waveform = make_waveform_image(signal, sample_rate, f"Осциллограмма: {FORMANTS[key]['title']}")
-        spectrogram = make_spectrogram_image(signal, sample_rate, f"Спектрограмма: {FORMANTS[key]['title']}")
+
+    for key, source in selected.items():
+        signal = decode_audio(source, args.sample_rate)
+        signal = trim_silence(signal, args.sample_rate)
+        signal = normalize(signal)
+        write_wav(input_dir / converted_names[key], signal, args.sample_rate)
+
+        analysis = analyze_sample(signal, args.sample_rate, key)
+        waveform = make_waveform_image(signal, args.sample_rate, f"Осциллограмма записи {THEORY[key]['label']}")
+        spectrogram = make_spectrogram_image(signal, args.sample_rate, f"Спектрограмма записи {THEORY[key]['label']}")
+        envelope_plot = make_envelope_plot(
+            analysis["envelope_freqs"],
+            analysis["envelope_values"],
+            analysis["formants_hz"],
+            THEORY[key]["formants"],
+            f"Спектральная огибающая записи {THEORY[key]['label']}",
+        )
+
         waveform.save(waveform_dir / f"{key}_waveform.png")
         spectrogram.save(spectrogram_dir / f"{key}_spectrogram.png")
-        analysis = analyze_signal(signal, sample_rate, key)
-        save_track_csv(track_dir / f"{key}_track.csv", analysis["frames"])  # type: ignore[arg-type]
-        results[key] = analysis
-        panels[key] = make_sample_panel(key, waveform, spectrogram, analysis)
+        envelope_plot.save(envelope_dir / f"{key}_envelope.png")
+        save_track_csv(track_dir / f"{key}_track.csv", analysis["frames"])
 
-    save_summary_csv(output_dir / "summary_metrics.csv", results)
-    build_readme_pdf(root, panels, results)
+        analyses[key] = analysis
+        panels[key] = make_panel(key, source_meta[key], waveform, spectrogram, envelope_plot, analysis, signal.size / args.sample_rate)
+        f1, f2, f3 = analysis["formants_hz"]
+        summary_rows.append(
+            [
+                THEORY[key]["label"],
+                source_meta[key]["name"],
+                source_meta[key]["duration_s"],
+                source_meta[key]["sample_rate_hz"],
+                source_meta[key]["channels"],
+                f"{signal.size / args.sample_rate:.2f}",
+                f"{float(analysis['min_f0_hz']):.2f}",
+                f"{float(analysis['max_f0_hz']):.2f}",
+                f"{float(analysis['richest_time_s']):.2f}",
+                f"{float(analysis['richest_f0_hz']):.2f}",
+                str(int(analysis["overtone_count"])),
+                f"{float(analysis['formant_time_s']):.2f}",
+                f"{float(f1):.2f}",
+                f"{float(f2):.2f}",
+                f"{float(f3):.2f}",
+            ]
+        )
+
+    save_summary_csv(output_dir / "summary_metrics.csv", summary_rows)
+    build_readme_pdf(root, source_meta, analyses, panels)
     print(f"Saved lab to: {root}")
     return 0
 
