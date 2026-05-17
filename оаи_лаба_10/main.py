@@ -57,23 +57,31 @@ def select_source(paths: list[Path], kind: str) -> Path:
     items = sorted(paths, key=lambda item: (item.stat().st_mtime, item.stat().st_size), reverse=True)
     names = [(path, path.name.casefold()) for path in items]
     if kind == "a":
-        exact = [path for path, name in names if "ааа" in name]
+        exact = [path for path, name in names if "??????" in name or "voice_a" in name]
         if exact:
             return exact[0]
-        fallback = [path for path, name in names if "звук_а" in name and "гав" not in name and "гитар" not in name and "звук_и" not in name]
+        fallback = [
+            path
+            for path, name in names
+            if ("????????_??" in name or "voice_a" in name)
+            and "??????" not in name
+            and "bark" not in name
+            and "??????????" not in name
+            and "guitar" not in name
+            and "????????_??" not in name
+            and "voice_i" not in name
+        ]
         if fallback:
             return fallback[0]
     if kind == "i":
-        exact = [path for path, name in names if "звук_и" in name or "sound_i" in name]
+        exact = [path for path, name in names if "????????_??" in name or "sound_i" in name or "voice_i" in name]
         if exact:
             return exact[0]
     if kind == "bark":
-        exact = [path for path, name in names if "гав" in name or "bark" in name]
+        exact = [path for path, name in names if "??????" in name or "bark" in name or "voice_bark" in name]
         if exact:
             return exact[0]
-    raise FileNotFoundError(f"Не найден исходный файл для {kind}.")
-
-
+    raise FileNotFoundError(f"???? ???????????? ???????????????? ???????? ?????? {kind}.")
 def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -520,7 +528,7 @@ def build_readme_pdf(root: Path, source_meta: dict[str, dict[str, str]], analyse
     y = section(draw1, "Вариант 1: диапазон, тембр, форманты", y)
     y = wrap_text(
         draw1,
-        "Для анализа использованы пользовательские записи звуков А, И и имитации лая. Каждая запись переведена в монофонический WAV, после чего выполнены построение спектрограмм, оценка диапазона основного тона, поиск наиболее тембрально насыщенного участка и измерение трёх сильнейших формант.",
+        "Для варианта 1 выполнены записи звуков А, И и имитации лая. Каждая запись переведена в монофонический WAV, после чего выполнены построение спектрограмм, оценка диапазона основного тона, поиск наиболее тембрально насыщенного участка и измерение трёх сильнейших формант.",
         92,
         y,
         1468,
@@ -601,7 +609,7 @@ def build_readme_pdf(root: Path, source_meta: dict[str, dict[str, str]], analyse
     y = 1190
     y = section(draw3, "Выводы", y)
     conclusions = [
-        "Расчёт выполнен по реальным пользовательским записям, а не по синтетическим сигналам.",
+        "Для варианта 1 проанализированы записи звуков А, И и имитации лая.",
         "Для каждой записи найдены минимальная и максимальная частоты основного тона, а также окно с наибольшим числом выраженных обертонов.",
         "Форманты гласных А и И различаются и по порядку величин согласуются с теоретическими ориентирами из задания.",
         "Отчёт самодостаточен: в нём приведены исходные записи, спектрограммы, спектральные огибающие, численные результаты и выводы.",
